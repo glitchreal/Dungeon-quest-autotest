@@ -92,3 +92,6 @@
 
 ## Attempt 19 — Northern Lands (FAILED)
 - Boss 5Q → 3.10Q (~62%), then run ended. 0/19. Unchanged.
+
+## Attempt 20 — Northern Lands (FAILED)
+- Boss 5Q → 3.31Q (~66%), then run ended. 0/20. Twenty consecutive Northern Lands runs, best boss 23% (attempt 3), typical stall 55–80%. Fast-carry profile still unvalidated (no non-Northern runs queued).
