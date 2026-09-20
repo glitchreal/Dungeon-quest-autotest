@@ -149,10 +149,10 @@
     },
     {
       "access": "unknown",
-      "attempts": 17,
+      "attempts": 18,
       "availability": "visible-in-queue",
       "clears": 0,
-      "deaths": 55,
+      "deaths": 58,
       "difficulty": "unknown",
       "damageTaken": 432927456,
       "durationSec": 0,
@@ -175,12 +175,13 @@
         "Attempt 14: NO CLEAR. Boss 5Q->3.37Q (~67%) then run ended. 0/14.",
         "Attempt 15: NO CLEAR. Boss 5Q->3.03Q (~61%) then run ended. 0/15.",
         "Attempt 16: NO CLEAR. Boss 5Q->2.94Q (~59%) then run ended. 0/16.",
-        "Attempt 17: NO CLEAR. Boss 5Q->3.86Q (~77%) then run ended. 0/17."
+        "Attempt 17: NO CLEAR. Boss 5Q->3.86Q (~77%) then run ended. 0/17.",
+        "Attempt 18: NO CLEAR. Boss 5Q->3.98Q (~80%) then run ended. 0/18."
       ],
-      "failures": 17,
+      "failures": 18,
       "hitlessClears": 0,
-      "lastCommit": "ebb0130",
-      "lastTested": "2026-09-20T10:06:11Z",
+      "lastCommit": "ac17fd9",
+      "lastTested": "2026-09-20T10:16:19Z",
       "name": "Northern Lands",
       "status": "blocked"
     },
