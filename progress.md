@@ -21,3 +21,10 @@
 - Phase 6: SCAFFOLD DONE. Live queue probe: level 201, 19 dungeons visible (Aquatic Temple first pending; includes Ghastly Harbor → Northern Lands). Matrix `testing/dungeon-results.json` persists all required fields; clears only on observed completion, hitless only on zero damage.
 - Phase 9: SCAFFOLD DONE. `tools/dq-controller.sh` enforces 32 iters / 15 min / 3 recoveries / 3 repeat fixes / 1 client / 1 agent / no paid models + STOP file. macOS has no `timeout` cmd — iteration timeout must be enforced by caller/supervisor.
 - Next: need from user (a) authorized private-server link (or confirmation StandardServer is acceptable), (b) approval for one controlled local-build load test in the lobby, (c) explicit approval before any overnight run. No dungeon clears claimed yet.
+
+## Attempt 1 — Northern Lands (FAILED, no clear observed)
+- Lobby bundle `dist/lobby.luau` executed clean (no DQ errors). Teleport lobby→dungeon (ReservedServer, Northern Lands) correctly treated as normal teleport, not crash.
+- Dungeon bundle `dist/dungeon.luau` loaded: `[EnemyWalker] loaded`. Run started (owner), progressed: 7→4→1 enemies, ~170-stud advance, zero damage until boss room.
+- Boss: Midgardian Champion (3.19Q/5Q last seen, ~64%). Death loop: full-HP (432M) respawn → 1-2 shot burst (~100-200M then negative within ~1s) → repeat, ≥4 deaths. Returned to lobby; bossKilled never observed → recorded as failure, NOT a clear.
+- Root-cause hypothesis: all smash close-and-strafe handling is gated on `target.Name == "Ancient Temple Protector"` (`src/CombatController.luau:2001`, `1965`, `1782`, `1288`, `1346`); Midgardian Champion slams get only generic backward dodge. Fix must be geometry-triggered (ProtectorSmash-shaped zones already sampled at :1212) rather than name-gated, but needs live telegraph evidence first. No code changed yet — diagnosis only, per no-untested-push rule.
+- Limits used: 1 dungeon attempt, 0 code fixes for this problem (budget 3).
