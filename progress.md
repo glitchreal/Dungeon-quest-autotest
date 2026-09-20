@@ -62,3 +62,6 @@
 
 ## Attempt 9 — Northern Lands (FAILED)
 - Boss 5Q → 3.19Q (~64%), then run ended. 0/9. Unchanged pattern.
+
+## Attempt 10 — Northern Lands (FAILED)
+- Boss 5Q → 2.79Q (~56%), then run ended. 0/10. Blocked status stands. Ten consecutive runs, all Northern Lands, best boss 23% (attempt 3), typical stall 55–67%.
