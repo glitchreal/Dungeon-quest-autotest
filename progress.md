@@ -56,3 +56,6 @@
 
 ## Attempt 7 — Northern Lands (FAILED)
 - Boss 5Q → 3.03Q (~61%), then run ended. Seventh consecutive failure, pattern unchanged (grind with respawn-deaths, no clear). Blocked status stands; awaiting a non-Northern run to validate Fast Carry.
+
+## Attempt 8 — Northern Lands (FAILED)
+- Boss 5Q → 3.37Q (~67%), then run ended. 0/8. The loop is fully consistent: trash 2-shots, Champion one-shots/beams, grind stalls at 23–67%, timer or deaths end it. No further code changes for Northern without new evidence or gear changes.
