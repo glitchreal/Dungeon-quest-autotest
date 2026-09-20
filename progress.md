@@ -68,3 +68,6 @@
 
 ## Attempt 11 — Northern Lands (FAILED)
 - Boss 5Q → 2.98Q (~60%), then run ended. 0/11. Unchanged.
+
+## Attempt 12 — Northern Lands (FAILED)
+- Boss 5Q → 3.07Q (~61%), then run ended. 0/12. Unchanged.
