@@ -149,10 +149,10 @@
     },
     {
       "access": "unknown",
-      "attempts": 6,
+      "attempts": 7,
       "availability": "visible-in-queue",
       "clears": 0,
-      "deaths": 22,
+      "deaths": 25,
       "difficulty": "unknown",
       "damageTaken": 432927456,
       "durationSec": 0,
@@ -164,12 +164,13 @@
         "Attempt 3 (NEW build: profiles + cross fix): NO CLEAR. Boss ground to 1.17Q/5Q (~23%) but progress went outOfTime. Deaths continued (2-shot bursts). Cross-substring fix did not observably prevent deaths; next: verify crisscross part transparency (<0.95 required for named-zone tracking) during windup.",
         "Attempt 4 (NEW build): NO CLEAR. Boss 5Q->2.77Q (~55%) then run ended back in lobby. One-shot events persist (full 432M -> dead in a single damage event #31/#34). Cross volley now tracked as zones but deaths continue; unknown if deaths are cross-volley or another attack (contact?).",
         "Attempt 5 (instrumented build): NO CLEAR. Boss 5Q->3.85Q (~77%) then run ended. Attribution via DQLastDamage: deaths inside overlapping Block zones (clearances -11..-1); one-shot 497M from 'firstBossBeamPart.Beam' instant beam; trash 176M/hit from Northern Spearman with 10 active hazards. BLOCKER: Champion one-shots (400-500M) vs 432M HP + trash 2-shots; script grinds to 23-55% but cannot finish within timer. Fix budget for dodge approach exhausted (cross fix saw 3 runs, no clear).",
-        "Attempt 6 (committed build f7704f3): NO CLEAR. Boss 5Q->3.37Q (~67%) then run ended. Consistent with blocked status."
+        "Attempt 6 (committed build f7704f3): NO CLEAR. Boss 5Q->3.37Q (~67%) then run ended. Consistent with blocked status.",
+        "Attempt 7: NO CLEAR. Boss 5Q->3.03Q (~61%) then run ended. Pattern unchanged across 7 runs."
       ],
-      "failures": 6,
+      "failures": 7,
       "hitlessClears": 0,
-      "lastCommit": "f7704f3",
-      "lastTested": "2026-09-20T08:16:13Z",
+      "lastCommit": "b42c7b6",
+      "lastTested": "2026-09-20T08:26:04Z",
       "name": "Northern Lands",
       "status": "blocked"
     },

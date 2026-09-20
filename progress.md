@@ -53,3 +53,6 @@
 ## Attempt 6 — Northern Lands (FAILED, committed build f7704f3)
 - Boss 5Q → 3.37Q (~67%), then run ended with no clear. Sixth consecutive failure; blocked status stands.
 - Also fixed `AGENTS.md` in this checkout to document the autotest remote policy (origin-only pushes), since the old text named the original repo as push target.
+
+## Attempt 7 — Northern Lands (FAILED)
+- Boss 5Q → 3.03Q (~61%), then run ended. Seventh consecutive failure, pattern unchanged (grind with respawn-deaths, no clear). Blocked status stands; awaiting a non-Northern run to validate Fast Carry.
