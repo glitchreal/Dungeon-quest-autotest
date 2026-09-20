@@ -149,10 +149,10 @@
     },
     {
       "access": "unknown",
-      "attempts": 8,
+      "attempts": 9,
       "availability": "visible-in-queue",
       "clears": 0,
-      "deaths": 28,
+      "deaths": 31,
       "difficulty": "unknown",
       "damageTaken": 432927456,
       "durationSec": 0,
@@ -166,12 +166,13 @@
         "Attempt 5 (instrumented build): NO CLEAR. Boss 5Q->3.85Q (~77%) then run ended. Attribution via DQLastDamage: deaths inside overlapping Block zones (clearances -11..-1); one-shot 497M from 'firstBossBeamPart.Beam' instant beam; trash 176M/hit from Northern Spearman with 10 active hazards. BLOCKER: Champion one-shots (400-500M) vs 432M HP + trash 2-shots; script grinds to 23-55% but cannot finish within timer. Fix budget for dodge approach exhausted (cross fix saw 3 runs, no clear).",
         "Attempt 6 (committed build f7704f3): NO CLEAR. Boss 5Q->3.37Q (~67%) then run ended. Consistent with blocked status.",
         "Attempt 7: NO CLEAR. Boss 5Q->3.03Q (~61%) then run ended. Pattern unchanged across 7 runs.",
-        "Attempt 8: NO CLEAR. Boss 5Q->3.37Q (~67%) then run ended. 0/8."
+        "Attempt 8: NO CLEAR. Boss 5Q->3.37Q (~67%) then run ended. 0/8.",
+        "Attempt 9: NO CLEAR. Boss 5Q->3.19Q (~64%) then run ended. 0/9."
       ],
-      "failures": 8,
+      "failures": 9,
       "hitlessClears": 0,
-      "lastCommit": "9a2a9be",
-      "lastTested": "2026-09-20T08:36:05Z",
+      "lastCommit": "e817432",
+      "lastTested": "2026-09-20T08:46:07Z",
       "name": "Northern Lands",
       "status": "blocked"
     },
