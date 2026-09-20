@@ -117,3 +117,6 @@
 ## MCP bridge drop (game alive, connector down)
 - `list-clients` empty across multiple minutes while `RobloxPlayer` process remains running. Not a game crash (watchdog `check` passes) — the MacSploit MCP connector bridge dropped and only re-establishes via in-client autoexec on teleport/join. Cannot re-establish from outside. Waiting for reconnect; no data lost (`testing/dungeon-results.json` persisted through attempt 26, pushed).
 - `testing/watchdog-state.json` + `testing/STOP` are local runtime state (now git-ignored, never committed).
+
+## MCP bridge restored
+- After ~6h down (game process alive throughout), a fresh MCP client reconnected in the lobby. Lobby bundle reloaded clean. Resuming run tracking.
