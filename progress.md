@@ -49,3 +49,7 @@
 - DQLastDamage attribution (verified working): deaths occur standing inside 3-4 overlapping Block zones (clearances −11…−1); a 497M one-shot came from `firstBossBeamPart.Beam` (instant beam, tracked but inescapable once inside); trash Northern Spearman hits 176M with 10 active hazards.
 - BLOCKER (retry budget for dodge tuning exhausted — cross fix saw runs 3–5, no clear): Midgardian Champion one-shots (400–500M instant beams/volleys) vs 432M HP, plus 2-shot trash. Script reliably grinds boss to 23–55% but cannot finish within the timer. Likely needs gear/levels or a Champion-specific pre-positioning approach beyond current budget. Northern stays `blocked`; will retest opportunistically if the user queues it again, but focus pivots to validating the Fast Carry profile on the other 18 dungeons.
 - Fast-carry dungeons: 0 attempts so far (user queued Northern Lands 5×). Next non-Northern run exercises the fast profile (already in build).
+
+## Attempt 6 — Northern Lands (FAILED, committed build f7704f3)
+- Boss 5Q → 3.37Q (~67%), then run ended with no clear. Sixth consecutive failure; blocked status stands.
+- Also fixed `AGENTS.md` in this checkout to document the autotest remote policy (origin-only pushes), since the old text named the original repo as push target.

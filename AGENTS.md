@@ -1,4 +1,9 @@
-# Project Workflow
+# Project Workflow (autotest mirror)
+
+- This checkout pushes to `origin` = `glitchreal/Dungeon-quest-autotest` (private) ONLY.
+- `upstream` = `glitchreal/Dungeon-quest` (original) is fetch-only; never push there.
+- Keep the repository limited to the Obsidian hub, its loader, source, generated
+  runtime bundles, and project documentation (`progress.md`, `testing/`, `tools/`).
 
 - This repository is the source of truth for Dungeon Quest Obsidian work.
 - Keep the repository limited to the Obsidian hub, its loader, source, generated
