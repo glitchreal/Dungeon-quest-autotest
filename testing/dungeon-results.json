@@ -149,24 +149,28 @@
     },
     {
       "access": "unknown",
-      "attempts": 1,
+      "attempts": 5,
       "availability": "visible-in-queue",
       "clears": 0,
-      "deaths": 4,
+      "deaths": 19,
       "difficulty": "unknown",
       "damageTaken": 432927456,
       "durationSec": 0,
       "errors": [
         "Death near boss room (~-600,21,390): two-shot burst 432M->~100M->negative within ~1s; suspected Northern Lands boss smash/telegraph gap",
         "Respawn-death loop vs Midgardian Champion (boss 3.19Q/5Q at check): full-HP respawn then 1-2 shot bursts; run still inProgress",
-        "Attempt 1 result: NO CLEAR observed. Returned to lobby with boss last seen at 3.19Q/5Q (~64%). Respawn-death loop vs Midgardian Champion."
+        "Attempt 1 result: NO CLEAR observed. Returned to lobby with boss last seen at 3.19Q/5Q (~64%). Respawn-death loop vs Midgardian Champion.",
+        "Attempt 2 (pre-profile build): NO CLEAR observed. Boss Midgardian Champion last at 4.24Q/5Q (~85%), same 2-shot respawn-death loop. Live evidence: 12+ anchored telegraph parts named 'firstBossCrissCross' during slam windup; dangerousName() did not recognize them (no 'cross' substring) and MeshPart class fails Part-based precast geometry checks -> slam invisible to dodger.",
+        "Attempt 3 (NEW build: profiles + cross fix): NO CLEAR. Boss ground to 1.17Q/5Q (~23%) but progress went outOfTime. Deaths continued (2-shot bursts). Cross-substring fix did not observably prevent deaths; next: verify crisscross part transparency (<0.95 required for named-zone tracking) during windup.",
+        "Attempt 4 (NEW build): NO CLEAR. Boss 5Q->2.77Q (~55%) then run ended back in lobby. One-shot events persist (full 432M -> dead in a single damage event #31/#34). Cross volley now tracked as zones but deaths continue; unknown if deaths are cross-volley or another attack (contact?).",
+        "Attempt 5 (instrumented build): NO CLEAR. Boss 5Q->3.85Q (~77%) then run ended. Attribution via DQLastDamage: deaths inside overlapping Block zones (clearances -11..-1); one-shot 497M from 'firstBossBeamPart.Beam' instant beam; trash 176M/hit from Northern Spearman with 10 active hazards. BLOCKER: Champion one-shots (400-500M) vs 432M HP + trash 2-shots; script grinds to 23-55% but cannot finish within timer. Fix budget for dodge approach exhausted (cross fix saw 3 runs, no clear)."
       ],
-      "failures": 1,
+      "failures": 5,
       "hitlessClears": 0,
-      "lastCommit": "edb7d17",
-      "lastTested": "2026-09-20T07:20:57Z",
+      "lastCommit": "3b652ff",
+      "lastTested": "2026-09-20T08:06:04Z",
       "name": "Northern Lands",
-      "status": "failed"
+      "status": "blocked"
     },
     {
       "access": "unknown",

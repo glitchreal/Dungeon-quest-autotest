@@ -721,7 +721,12 @@ connect(RunService.Heartbeat, function(dt)
         local damageBuffer = damage and now - damage.at < 5 and 3 or 0
         distance = distance + math.max(healthBuffer, damageBuffer)
     end
-    local soloHitless = C.SoloHitless and #Players:GetPlayers() == 1
+    local dungeonName = Adapter.value(workspace, "dungeonName", nil)
+    -- Carry profiles auto-select by dungeon name: Northern Lands keeps full
+    -- survival behavior, every other dungeon runs Fast Carry (close distance,
+    -- base margins, no forced solo-hitless standoff). User toggles preserved.
+    local northernCombat = Logic.carryProfile(dungeonName) == "northern"
+    local soloHitless = C.SoloHitless and #Players:GetPlayers() == 1 and northernCombat
     if soloHitless then distance = math.max(distance, 20) end
     if target and target.Name == "Ancient Temple Protector" then distance = 16 end
     if C.SmartFarm and controller.AbilityStatus then
@@ -743,7 +748,8 @@ connect(RunService.Heartbeat, function(dt)
     cfg.PRECAST_MARGIN = math.max(C.SafetyDistance, soloHitless and 6 or 0)
     cfg.HAZARD_MARGIN = math.max(6, C.SafetyDistance + 3, soloHitless and 9 or 0)
     cfg.AUTO_ABILITIES, cfg.AUTO_DODGE = C.AutoAbilities, C.AutoDodge or soloHitless
-    cfg.HITLESS_SOLO = C.SoloHitless
+    cfg.HITLESS_SOLO = C.SoloHitless and northernCombat
+    cfg.FAST_CARRY, cfg.NORTHERN_COMBAT = not northernCombat, northernCombat
     cfg.REACTION_TIME = soloHitless and math.min(C.ReactionTime, 0.05) or C.ReactionTime
     cfg.PROJECTILE_LOOKAHEAD = soloHitless and 1.75 or 1.35
     cfg.THREAT_RADIUS = soloHitless and 120 or 90

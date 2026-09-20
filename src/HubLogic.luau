@@ -43,6 +43,13 @@ function Logic.raidTiers(inventory)
     return tiers
 end
 
+-- Carry profiles, auto-selected by dungeon name. Fast Carry one-shots and
+-- optimizes for clear time; Northern Lands needs survival + damage balance.
+function Logic.carryProfile(dungeonName)
+    if dungeonName == "Northern Lands" then return "northern" end
+    return "fast"
+end
+
 function Logic.duration(seconds)
     seconds = math.max(0, math.floor(seconds))
     return string.format("%02d:%02d:%02d", math.floor(seconds / 3600), math.floor(seconds / 60) % 60, seconds % 60)

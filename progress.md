@@ -28,3 +28,24 @@
 - Boss: Midgardian Champion (3.19Q/5Q last seen, ~64%). Death loop: full-HP (432M) respawn → 1-2 shot burst (~100-200M then negative within ~1s) → repeat, ≥4 deaths. Returned to lobby; bossKilled never observed → recorded as failure, NOT a clear.
 - Root-cause hypothesis: all smash close-and-strafe handling is gated on `target.Name == "Ancient Temple Protector"` (`src/CombatController.luau:2001`, `1965`, `1782`, `1288`, `1346`); Midgardian Champion slams get only generic backward dodge. Fix must be geometry-triggered (ProtectorSmash-shaped zones already sampled at :1212) rather than name-gated, but needs live telegraph evidence first. No code changed yet — diagnosis only, per no-untested-push rule.
 - Limits used: 1 dungeon attempt, 0 code fixes for this problem (budget 3).
+
+## Attempt 2 — Northern Lands (FAILED, pre-profile build)
+- Same pattern: reached Midgardian Champion at full 5Q, ground it to 4.24Q/5Q (~85%) with repeated 2-shot respawn-deaths (full 432M → ~210M → negative). Returned to lobby, bossKilled never observed.
+- KEY EVIDENCE (live probe during windup): 12+ anchored telegraph parts named `firstBossCrissCross`. `dangerousName()` had no matching substring (`cross` absent) and MeshPart class fails the Part-based precast geometry checks → slam telegraphs invisible to the dodger. Player stood in the cross pattern and ate full bursts.
+- Fix implemented (UNCOMMITTED, needs verification): `dangerousName()` now matches `cross` (`src/CombatController.luau`); dual carry profiles auto-selected by dungeon name (`Logic.carryProfile`: `northern` only for Northern Lands, `fast` elsewhere; solo-hitless forcing + HITLESS_SOLO gated to northern; FAST_CARRY/NORTHERN_COMBAT flags in cfg). Rebuilt `dist/` clean. New lobby build executed in fresh lobby with no DQ errors.
+- Verification plan: next dungeon teleport gets the new dungeon bundle via execute-file. Commit ONLY after observing dodged crisscross volleys or a clear. Fixes used for this problem: 1 of 3 (cross-substring). Profiles: 0 of 3.
+
+## Attempt 3 — Northern Lands (FAILED outOfTime, NEW build)
+- New build (profiles + cross fix) loaded via execute-file; EnemyWalker active.
+- Boss ground 5Q → 1.17Q (~23%, best yet) but progress flipped to `outOfTime` with player dead. Deaths continued through trash and boss phases.
+- Assessment: cross-substring fix shows NO observable survival improvement yet. Open hypotheses: (a) crisscross parts spawn with transparency >= 0.95 (named-zone check requires < 0.95); (b) deaths come from a different attack (contact bursts, not the cross volley); (c) post-respawn re-engagement walks into active volleys.
+- Next: capture crisscross part transparency + attributes during a live windup; check which damage source correlates with deaths. Code stays UNCOMMITTED.
+
+## Attempt 4 — Northern Lands (FAILED, NEW build)
+- Boss 5Q → 2.77Q (~55%), then run ended in lobby. One-shots persisted (full→dead single events). Cross fix shows no decisive effect yet.
+
+## Attempt 5 — Northern Lands (FAILED → status blocked, instrumented build)
+- Boss 5Q → 3.85Q (~77%). Run ended with no clear observed.
+- DQLastDamage attribution (verified working): deaths occur standing inside 3-4 overlapping Block zones (clearances −11…−1); a 497M one-shot came from `firstBossBeamPart.Beam` (instant beam, tracked but inescapable once inside); trash Northern Spearman hits 176M with 10 active hazards.
+- BLOCKER (retry budget for dodge tuning exhausted — cross fix saw runs 3–5, no clear): Midgardian Champion one-shots (400–500M instant beams/volleys) vs 432M HP, plus 2-shot trash. Script reliably grinds boss to 23–55% but cannot finish within the timer. Likely needs gear/levels or a Champion-specific pre-positioning approach beyond current budget. Northern stays `blocked`; will retest opportunistically if the user queues it again, but focus pivots to validating the Fast Carry profile on the other 18 dungeons.
+- Fast-carry dungeons: 0 attempts so far (user queued Northern Lands 5×). Next non-Northern run exercises the fast profile (already in build).

@@ -50,6 +50,8 @@ local CFG = {
     AUTO_ABILITIES = true,
     AUTO_DODGE = true,
     HITLESS_SOLO = true,
+    FAST_CARRY = false,
+    NORTHERN_COMBAT = true,
     TELEPORT_DODGE = true,
     REACTION_TIME = 0.05,
     MELEE_DANGER_DISTANCE = 11,
@@ -192,7 +194,7 @@ local function dangerousName(instance)
         or name:find("spike", 1, true) or name:find("orb", 1, true)
         or name:find("blast", 1, true) or name:find("slam", 1, true)
         or name:find("flame", 1, true) or name:find("beam", 1, true)
-        or name:find("laser", 1, true)
+        or name:find("laser", 1, true) or name:find("cross", 1, true)
 end
 do
     local templates = game:GetService("ReplicatedStorage"):FindFirstChild("enemyProjectiles")
@@ -2600,6 +2602,7 @@ local function watchHealth(character)
                 state.lastDamage.nearestHazards = nearby
             end
             warn(string.format("[EnemyWalker] damage event #%d (%.0f -> %.0f)", state.damageEvents, previous, health))
+            pcall(function() getgenv().DQLastDamage = state.lastDamage end)
             logThreat("hit", { amount = math.floor(previous - health) })
         end
         previous = health
