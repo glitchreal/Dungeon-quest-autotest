@@ -2,3 +2,5 @@
 *.log
 DungeonQuestObsidian/
 DungeonQuestObsidian-config.json
+testing/watchdog-state.json
+testing/STOP
