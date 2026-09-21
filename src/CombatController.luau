@@ -1310,6 +1310,17 @@ local function issueMove(humanoid, position, mode, now, bypass)
         end
     end
     if changed or now - state.lastMoveToCall >= CFG.MOVETO_REFRESH_INTERVAL then
+        -- Turn counting: consecutive physical goals reversing >90 degrees.
+        -- Refresh re-issues don't count (same direction); only real zigzag.
+        local prev = state.lastMoveVec
+        local vec = position - state.lastMoveToPosition
+        if prev and vec.Magnitude > 1 and prev.Magnitude > 1 then
+            if vec.Unit:Dot(prev.Unit) < 0 then
+                state.moveTurns = (state.moveTurns or 0) + 1
+            end
+        end
+        state.lastMoveVec = vec
+        state.cmdHeading, state.cmdHeadingAt = vec.Magnitude > 1 and vec or nil, now
         humanoid:MoveTo(position)
         state.moveToCount = (state.moveToCount or 0) + 1
         state.lastMoveToCall = now
@@ -1438,6 +1449,16 @@ local function chooseFallbackStep(rootPart, goal, target)
     local radii = state.fallbackStreak >= 6 and { 8, 14, 20 }
         or state.fallbackStreak >= 3 and { 8, 14 } or { 8 }
     local best, bestScore
+    -- Current heading: prefer the last COMMANDED direction (physics
+    -- velocity is often unreadable from executor context). Reversing the
+    -- committed heading reads as zigzag; penalize hard reversals so the fan
+    -- commits to a side instead of ping-ponging every step.
+    local heading = state.cmdHeading and (os.clock() - state.cmdHeadingAt < 1.0)
+        and state.cmdHeading or nil
+    if not heading then
+        local vel = rootPart.AssemblyLinearVelocity
+        heading = (vel.Magnitude > 2 and Vector3.new(vel.X, 0, vel.Z)) or nil
+    end
     for _, radius in ipairs(radii) do
         for index = 0, 7 do
             local angle = index * math.pi / 4
@@ -1453,6 +1474,10 @@ local function chooseFallbackStep(rootPart, goal, target)
                     + visitPenalty
                     + cellCostAt(candidate, now) * 2
                     - math.max(0, direction:Dot(forward)) * radius * 0.5
+                if heading and heading.Magnitude > 0.1
+                    and direction:Dot(heading.Unit) < -0.3 then
+                    score = score + 30
+                end
                 if not bestScore or score < bestScore then best, bestScore = candidate, score end
             end
         end
@@ -3279,10 +3304,10 @@ local function controllerTick()
             move = (function()
                 local c = state.moveCmd
                 if not c then return tostring(state.moveReason) end
-                return string.format("%s:%s>%.0f,%.0f,%.0f age%.1f rp%d mt%d %s",
+                return string.format("%s:%s>%.0f,%.0f,%.0f age%.1f rp%d mt%d tn%d %s",
                     c.kind, c.source, c.goal.X, c.goal.Y, c.goal.Z,
                     now - c.at, state.moveReplans or 0, state.moveToCount or 0,
-                    tostring(state.moveReason))
+                    state.moveTurns or 0, tostring(state.moveReason))
             end)(),
         }
         -- Full pattern DB for controlled per-pattern tests (read-only).
