@@ -12,7 +12,7 @@
   "dungeons": [
     {
       "access": "unknown",
-      "attempts": 6,
+      "attempts": 7,
       "availability": "visible-in-queue",
       "clears": 0,
       "deaths": 0,
@@ -26,9 +26,10 @@
         "Attempt 3 (unified-arb build, FAST): job 54e4a00c. Controller frozen all run by Lua use-before-def nil-call bug (routeMemory/smashZonesActive/buildRaycastParams refs bound to globals) — every tick errored, bot stood still taking hits (15x44M damage events). Anti-cheat kick message also seen in console. No clear. Bug class fixed + static checker added.",
         "Attempt 4 (fixed build, FAST): job 2ac31347. DQNav live, zero tick errors, arbitration visible (evade:separation vs pylon @7.8 studs). Replan metric hit 782 in ~2 min = evade arrival-consumption flip-flop evidence. Fixed (arrivals consume nav only). No clear observed; run teleported out.",
         "Attempt 5 (arb+replan-fix build, FAST): job 39ffd3b9. 49 dodge-blinks in 75s vs Temple Guard trash — facing-snap windup over-triggered on high-HP trash ('Closing on smash windup' @42 studs). Fixed: smash response now requires Protector name or live ProtectorSmash geometry. Attack memory file 6556B confirmed persisting across teleports; route memory still empty (no transitions/edge-fails recorded yet). No clear observed.",
-        "Attempt 6 (Stage 2 + drop-edge build, FAST): job 4dafa8ff. BEST RUN YET. Reached room4/7 (4 transitions). Root-caused room3 stall with live geometry probe: pylon 24 studs below across floor gap + inviswall Part @7 studs; 203 ComputeAsync fails to same approach; 162s no progress in pending-step shuffle. Hot-loaded findDropEdge (dy<-8 + 2 goal fails -> ledge drop search, 4s commit): char y -5 -> -24 (gap crossed, verified), route room3 -> room4. Run ended back in lobby with 0 kills; no clear observed, NOT counted as clear."
+        "Attempt 6 (Stage 2 + drop-edge build, FAST): job 4dafa8ff. BEST RUN YET. Reached room4/7 (4 transitions). Root-caused room3 stall with live geometry probe: pylon 24 studs below across floor gap + inviswall Part @7 studs; 203 ComputeAsync fails to same approach; 162s no progress in pending-step shuffle. Hot-loaded findDropEdge (dy<-8 + 2 goal fails -> ledge drop search, 4s commit): char y -5 -> -24 (gap crossed, verified), route room3 -> room4. Run ended back in lobby with 0 kills; no clear observed, NOT counted as clear.",
+        "Attempt 7 (path-survival + stuck-fix build, FAST): job beac666b. Spawn-starvation root-caused (route paths discarded on target flap; stuck timers reset on lock switch). After hot-loads: spawn (-1004) -> room4 (-1623), rooms 1->4 verifying. Run total: 0 kills, 3 deaths, 109 recoveries, mt1210. Late-run state: route RESCANNED to 9 anchors (deaths trigger CharacterAdded route reset; Aquatic rooms/checkpoints are WAVE-LOCAL, not map-global), index back to 1/9, dungeonProgress empty (run ended, no bossKilled). No clear observed, NOT counted as clear. Core remaining failure: objectives 100-600 studs behind inviswalls/gaps, never within kill range."
       ],
-      "failures": 4,
+      "failures": 5,
       "hitlessClears": 0,
       "lastCommit": "",
       "lastTested": "2026-09-21T05:10:50Z",
