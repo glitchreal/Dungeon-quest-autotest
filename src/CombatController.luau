@@ -948,7 +948,11 @@ end
 local function getClosestEnemy(rootPart, now)
     refreshTargets(rootPart, now)
     -- Stable objective: hold the lock briefly so destinations don't thrash.
-    if now - (state.lastTargetChoice or 0) < 0.15 and isValidTarget(state.lockedTarget) then
+    -- When NOTHING is reachable (all candidates behind walls), distances are
+    -- all large and similar, so the lock would flap every 0.15s and every
+    -- in-flight route path would be discarded on arrival. Hold 1.0s instead.
+    local holdWindow = (state.reachableCount == 0) and 1.0 or 0.15
+    if now - (state.lastTargetChoice or 0) < holdWindow and isValidTarget(state.lockedTarget) then
         local root = getRootPart(state.lockedTarget)
         local distance = (rootPart.Position - root.Position).Magnitude
         if distance <= CFG.DETECTION_RADIUS and state.lockedTarget:IsDescendantOf(Workspace) then
@@ -1655,8 +1659,9 @@ local function followGoal(humanoid, rootPart, goal, mode, now, target)
             return
         end
         if state.closed or not state.running or humanoid.Health <= 0 or generation ~= state.pathGeneration
-            or player.Character ~= rootPart.Parent or not target.Parent
-            or not state.motionGoal or (state.motionGoal - goal).Magnitude > 8 then
+            or player.Character ~= rootPart.Parent
+            or (mode ~= "map-route" and (not target.Parent or not state.motionGoal
+                or (state.motionGoal - goal).Magnitude > 8)) then
             if path then path:Destroy() end
             return
         end
@@ -3379,7 +3384,12 @@ local function controllerTick()
             state.motionGoal, state.fallbackGoal = nil, nil
             state.pathUpdateTime = 0
         end
-        state.lastProgressDistance, state.stuckStartTime = math.huge, 0
+        state.lastProgressDistance = math.huge
+        -- NOTE: stuckStartTime is deliberately NOT reset here. Target lock
+        -- flaps between far blocked objectives; resetting the stuck timer on
+        -- every switch meant recovery could never mature (measured: 104s no
+        -- progress, 0 recoveries). Real distance improvement still resets it
+        -- in updateProgress.
         state.routeFails, state.wanderGoal, state.wallSide = 0, nil, nil
         state.wallVisits, state.wallFlips = {}, 0
     end
