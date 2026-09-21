@@ -34,6 +34,14 @@ local CFG = {
     STUCK_CHECK_INTERVAL = 0.35,
     STUCK_MOVE_THRESHOLD = 0.45,
     STUCK_TIMEOUT = 0.75,
+    -- Navigation progress is measured as distance-to-goal reduction, not raw
+    -- displacement. Sideways drift must not reset the stuck detector.
+    NAV_PROGRESS_EPS = 0.6,
+    NAV_REPLAN_MIN_GAIN = 1.0,
+    NAV_MAX_REPEATS = 3,
+    BLOCKED_SEGMENT_COOLDOWN = 30,
+    ANCHOR_REACH_FLAT = 14,
+    ANCHOR_REACH_VERTICAL = 12,
     FAILED_PATH_COOLDOWN = 2.5,
     TARGET_SCAN_INTERVAL = 0.25,
     DODGE_COOLDOWN = 0.5,
@@ -143,6 +151,46 @@ local state = {
     routeAnchors = {},
     routeAnchorIndex = 1,
     routeScannedAt = -math.huge,
+    -- Hierarchical navigation: global route edges are validated, not assumed.
+    -- blockedSegments maps "anchorIdx>anchorIdx" (or quantized goal pairs) to
+    -- { fails, blockedUntil }. A segment failing 3x is skipped for 30s instead of
+    -- being regenerated forever.
+    blockedSegments = {},
+    anchorFails = {},
+    roomHistory = {},
+    lastRoomAt = 0,
+    -- Learned traversal costmap: 6-stud XZ cells where paths failed, waypoints
+    -- stalled, or stuck recoveries fired. High-cost cells repel future local
+    -- exploration so the router stops re-walking dead ground. Entries decay
+    -- after 60s; only GLOBAL/LOCAL navigation reads it, never combat dodges.
+    cellCost = {},
+    fallbackStreak = 0,
+    doorHold = nil,
+    -- Movement ownership: exactly one of GLOBAL_NAVIGATION, LOCAL_NAVIGATION,
+    -- COMBAT_MOVEMENT, EMERGENCY_DODGE, RECOVERY controls the character.
+    -- Emergency dodge may preempt, then restores savedNavGoal afterwards.
+    moveOwner = "idle",
+    savedNavGoal = nil,
+    savedNavMode = nil,
+    -- True progress tracking: distance-to-goal samples + position loop memory.
+    navGoalKey = nil,
+    navBestDist = math.huge,
+    navBestAt = 0,
+    navSamples = {},
+    navLoopCount = 0,
+    -- Deterministic boss-attack memory (observation counts, warning stats).
+    attackMemory = {},
+    attackStats = { evasions = 0, hits = 0, falseAlarms = 0 },
+    attackMemoryLoaded = false,
+    -- Persistent route memory (per-map geometric experience).
+    routeMemory = {},
+    routeMemoryLoaded = false,
+    -- Diagnostics for the DQNav hook.
+    pathFailCount = 0,
+    firstFailedSegment = nil,
+    lastFailedSegment = nil,
+    lastVerifiedProgressAt = 0,
+    navTransitions = 0,
 }
 
 -- Ring-buffer recorder: zone sightings, escapes, teleports, hits.
@@ -156,6 +204,240 @@ local function logThreat(kind, info)
     end
     table.insert(state.threatLog, entry)
     while #state.threatLog > 160 do table.remove(state.threatLog, 1) end
+end
+
+-- Deterministic boss-attack memory: verified observations grouped by attack
+-- identity, persisted across restarts. This is a conventional predictive
+-- controller, not a neural network. Guesses are never stored as verified.
+-- Each observation records: attack/boss identity, warning geometry (center,
+-- size, shape), player + boss positions at warning time, warning age, and
+-- later movement/damage linkage. Targeting is classified from displacement
+-- correlation across re-sightings:
+--   "player-anchored" = zone appears at the player's warn-time position
+--   "tracking"        = zone center follows the player during the warning
+--   "fixed"           = zone stays put while the player moves (arena pattern)
+local ATTACK_MEMORY_FILE = "DungeonQuestObsidian-attack-memory.json"
+local function attackKey(bossName, attackName)
+    return (bossName or "?") .. "|" .. (attackName or "?")
+end
+local function quantizePos(pos)
+    if typeof(pos) ~= "Vector3" then return nil end
+    return string.format("%d,%d,%d", math.floor(pos.X), math.floor(pos.Y), math.floor(pos.Z))
+end
+local function loadAttackMemory()
+    if state.attackMemoryLoaded then return end
+    state.attackMemoryLoaded = true
+    if type(readfile) ~= "function" then return end
+    local ok, data = pcall(function()
+        return game:GetService("HttpService"):JSONDecode(readfile(ATTACK_MEMORY_FILE))
+    end)
+    if ok and type(data) == "table" then
+        state.attackMemory = data.patterns or {}
+        state.attackStats = data.stats or state.attackStats
+    end
+end
+local function saveAttackMemory()
+    if type(writefile) ~= "function" then return end
+    pcall(function()
+        game:GetService("HttpService"):JSONEncode({ patterns = state.attackMemory, stats = state.attackStats })
+        writefile(ATTACK_MEMORY_FILE, game:GetService("HttpService"):JSONEncode({ patterns = state.attackMemory, stats = state.attackStats }))
+    end)
+end
+local function observeAttack(bossName, attackName, warningTime, dangerSize, opts)
+    loadAttackMemory()
+    opts = opts or {}
+    local key = attackKey(bossName, attackName)
+    local entry = state.attackMemory[key] or { samples = 0, warnSum = 0, warnMin = math.huge, warnMax = 0,
+        sizeSum = 0, tracksPlayer = 0, fixedLocation = 0, arenaPattern = 0,
+        hits = 0, playerAnchored = 0, targeting = "unknown" }
+    entry.samples = entry.samples + 1
+    entry.warnSum = entry.warnSum + (warningTime or 0)
+    entry.warnMin = math.min(entry.warnMin, warningTime or math.huge)
+    entry.warnMax = math.max(entry.warnMax, warningTime or 0)
+    entry.sizeSum = entry.sizeSum + (dangerSize or 0)
+    if opts.tracksPlayer then entry.tracksPlayer = entry.tracksPlayer + 1 end
+    if opts.fixedLocation then entry.fixedLocation = entry.fixedLocation + 1 end
+    if opts.arenaPattern then entry.arenaPattern = entry.arenaPattern + 1 end
+    -- Targeting votes from displacement correlation (see updateAttackTracking).
+    if opts.targeting == "player-anchored" then entry.playerAnchored = (entry.playerAnchored or 0) + 1 end
+    if opts.targeting == "tracking" then entry.tracksPlayer = entry.tracksPlayer + 1 end
+    if opts.targeting == "fixed" then entry.fixedLocation = entry.fixedLocation + 1 end
+    entry.warnAvg = entry.warnSum / entry.samples
+    entry.sizeAvg = entry.sizeSum / entry.samples
+    entry.shape = opts.shape or entry.shape
+    entry.lastWarnPos = opts.warnPos or entry.lastWarnPos
+    entry.lastPlayerPos = opts.playerPos or entry.lastPlayerPos
+    entry.lastBossPos = opts.bossPos or entry.lastBossPos
+    entry.lastSeenAt = os.clock()
+    -- Majority vote over verified samples decides the targeting label.
+    do
+        local anchored, tracking, fixed = entry.playerAnchored or 0, entry.tracksPlayer or 0, entry.fixedLocation or 0
+        local best, label = 0, "unknown"
+        if anchored > best then best, label = anchored, "player-anchored" end
+        if tracking > best then best, label = tracking, "tracking" end
+        if fixed > best then best, label = fixed, "fixed" end
+        if entry.arenaPattern and entry.arenaPattern > best then label = "fixed" end
+        entry.targeting = label
+    end
+    -- Only trust patterns with >=3 verified samples.
+    entry.trusted = entry.samples >= 3
+    state.attackMemory[key] = entry
+    if entry.samples % 5 == 1 then saveAttackMemory() end
+    return entry
+end
+-- Per-warning tracking: compare zone-center displacement against player
+-- displacement since the warning appeared. Returns a targeting vote.
+-- Call every safety scan for live zones; cheap (one entry per zone id).
+local function updateAttackTracking(sample, zone, rootPart, bossRoot, now)
+    if not sample or not zone or not zone.frame then return nil end
+    local zonePos = zone.frame.Position
+    if not sample.trackWarnPos then
+        sample.trackWarnPos = zonePos
+        sample.trackPlayerPos = rootPart.Position
+        sample.trackAt = now
+        return nil
+    end
+    if now - (sample.trackAt or 0) < 0.3 then return nil end
+    local zoneMoved = (zonePos - sample.trackWarnPos).Magnitude
+    local playerMoved = (rootPart.Position - sample.trackPlayerPos).Magnitude
+    sample.trackAt = now
+    -- Player-anchored at cast: zone spawned within ~10 studs of the player.
+    if sample.trackVotes == nil then
+        sample.trackVotes = {}
+        local spawnDist = (sample.trackWarnPos - sample.trackPlayerPos).Magnitude
+        if spawnDist <= 10 then sample.trackVotes.anchored = true end
+    end
+    if zoneMoved >= 4 and playerMoved >= 4 then
+        -- Both moved: correlated direction => tracking, else fixed arena.
+        local zoneDir = (zonePos - sample.trackWarnPos).Unit
+        local playerDir = Vector3.new(
+            rootPart.Position.X - sample.trackPlayerPos.X, 0, rootPart.Position.Z - sample.trackPlayerPos.Z)
+        if playerDir.Magnitude > 0.1 then
+            local dot = zoneDir:Dot(playerDir.Unit)
+            sample.trackWarnPos = zonePos
+            sample.trackPlayerPos = rootPart.Position
+            if dot > 0.5 then return "tracking" end
+            return "fixed"
+        end
+    elseif zoneMoved >= 6 and playerMoved < 3 then
+        sample.trackWarnPos = zonePos
+        return "fixed"
+    elseif zoneMoved < 2 and playerMoved >= 6 then
+        sample.trackPlayerPos = rootPart.Position
+        return "fixed"
+    end
+    return nil
+end
+local function predictAttack(bossName, attackName)
+    loadAttackMemory()
+    local entry = state.attackMemory[attackKey(bossName, attackName)]
+    if entry and entry.trusted then return entry end
+    return nil
+end
+-- Prediction-aware clearance: a trusted pattern whose observed danger size
+-- exceeds the live part size expands the danger radius before activation.
+-- Unknown attacks fall back to reactive geometry with no false confidence.
+local function predictedClearance(zone, position, margin)
+    local clearance = ThreatGeometry.clearance(zone, position, margin)
+    if zone.predictedSize and zone.size then
+        local live = zone.size.Magnitude
+        if zone.predictedSize > live + 1 then
+            clearance = clearance - (zone.predictedSize - live) * 0.5
+        end
+    end
+    return clearance
+end
+local function predictedRisk(zones, position, margin)
+    local risk = 0
+    for _, zone in ipairs(zones) do
+        local clearance = predictedClearance(zone, position, margin)
+        if clearance < 0 then risk = risk + 1 + clearance * clearance end
+    end
+    return risk
+end
+
+-- Forward declaration (lexically BEFORE first use): route memory keys on
+-- the map name, but dungeonName() is defined further down. The assignment
+-- later fills this upvalue.
+local dungeonName
+
+-- Persistent route memory: per-map geometric experience (verified anchor
+-- transitions, anchor edge failures, completions, best time). Keyed by map
+-- name only — geometry does not change with difficulty. Entries expire after
+-- 14 days so reworked maps cannot poison routing forever. Used for exactly
+-- one behavior: historically-dead edges (6+ fails, 0 verified transitions)
+-- are treated as blocked immediately instead of costing 3 fresh strikes.
+-- Everything else still requires live verification every run.
+local ROUTE_MEMORY_FILE = "DungeonQuestObsidian-route-memory.json"
+local ROUTE_MEMORY_TTL = 14 * 24 * 3600
+local function routeMapKey()
+    return dungeonName() or "unknown"
+end
+local function loadRouteMemory()
+    if state.routeMemoryLoaded then return end
+    state.routeMemoryLoaded = true
+    if type(readfile) ~= "function" then return end
+    local ok, data = pcall(function()
+        return game:GetService("HttpService"):JSONDecode(readfile(ROUTE_MEMORY_FILE))
+    end)
+    if ok and type(data) == "table" then
+        state.routeMemory = data.maps or {}
+    end
+end
+local function saveRouteMemory()
+    if type(writefile) ~= "function" then return end
+    pcall(function()
+        writefile(ROUTE_MEMORY_FILE, game:GetService("HttpService"):JSONEncode({
+            maps = state.routeMemory, savedAt = os.time(),
+        }))
+    end)
+end
+local function routeMapEntry(create)
+    loadRouteMemory()
+    state.routeMemory = state.routeMemory or {}
+    local key = routeMapKey()
+    local entry = state.routeMemory[key]
+    if entry and os.time() - (entry.updatedAt or 0) > ROUTE_MEMORY_TTL then
+        state.routeMemory[key] = nil
+        entry = nil
+    end
+    if not entry and create then
+        entry = { transitions = {}, edgeFails = {}, completions = 0, bestTimeSec = 0, runs = 0, updatedAt = os.time() }
+        state.routeMemory[key] = entry
+    end
+    return entry
+end
+local function noteTransition(anchorName)
+    local entry = routeMapEntry(true)
+    if not entry then return end
+    entry.transitions[anchorName or "?"] = (entry.transitions[anchorName or "?"] or 0) + 1
+    entry.updatedAt = os.time()
+    entry._dirty = (entry._dirty or 0) + 1
+    if entry._dirty % 5 == 1 then saveRouteMemory() end
+end
+local function noteEdgeFail(anchorIndex)
+    local entry = routeMapEntry(true)
+    if not entry then return end
+    local key = tostring(anchorIndex)
+    entry.edgeFails[key] = (entry.edgeFails[key] or 0) + 1
+    entry.updatedAt = os.time()
+end
+local function edgeDeadFromHistory(anchorIndex)
+    local entry = routeMapEntry(false)
+    if not entry then return false end
+    return (entry.edgeFails[tostring(anchorIndex)] or 0) >= 6
+end
+local function noteCompletion(durationSec)
+    local entry = routeMapEntry(true)
+    if not entry then return end
+    entry.completions = entry.completions + 1
+    entry.runs = entry.runs + 1
+    if durationSec and durationSec > 0
+        and (entry.bestTimeSec == 0 or durationSec < entry.bestTimeSec) then
+        entry.bestTimeSec = durationSec
+    end
+    entry.updatedAt = os.time()
+    saveRouteMemory()
 end
 
 local abilities = AbilityController.new(player, function(slot)
@@ -389,20 +671,28 @@ local function getRootPart(model)
     return model.PrimaryPart
 end
 
-local function dungeonName()
+dungeonName = function()
     local value = Workspace:FindFirstChild("dungeonName")
     return value and value:IsA("ValueBase") and tostring(value.Value) or nil
 end
 
--- Dungeon maps expose their intended room order through checkPoint parts. Use
--- that authored route whenever replicated enemies are visible through a wall;
--- direct nearest-enemy steering otherwise cuts across folded rooms and doors.
+-- Dungeon maps expose their intended room order through checkPoint parts. The
+-- authored order is a HINT, not a connectivity guarantee: consecutive numbers
+-- may sit behind walls, locked doors, or on different floors. Treat anchors as
+-- graph nodes; an edge is traversable only when a probe (direct walk or
+-- PathfindingService) actually succeeds. Failed edges are recorded and skipped
+-- for BLOCKED_SEGMENT_COOLDOWN instead of being retried forever.
+-- Forward declaration: the scan-time door probe below uses isDoorName,
+-- defined with the other segment helpers further down.
+local isDoorName
 local function refreshRouteAnchors(now)
     local name = dungeonName()
     if state.routeDungeon == name and #state.routeAnchors > 0 then return end
     if state.routeDungeon == name and now - state.routeScannedAt < 2 then return end
     state.routeDungeon, state.routeAnchors, state.routeAnchorIndex = name, {}, 1
     state.routeScannedAt = now
+    state.blockedSegments = {}
+    state.anchorFails = {}
     local dungeon = Workspace:FindFirstChild("dungeon")
     if not dungeon then return end
     for _, instance in ipairs(dungeon:GetDescendants()) do
@@ -410,13 +700,135 @@ local function refreshRouteAnchors(now)
             local room = instance.Parent and instance.Parent.Name or ""
             local number = tonumber(room:lower():match("room(%d+)"))
             local order = number or (room:lower():find("boss", 1, true) and 1000 or 900)
-            table.insert(state.routeAnchors, { part = instance, order = order, name = room })
+            table.insert(state.routeAnchors, { part = instance, order = order, name = room, fails = 0 })
         end
     end
     table.sort(state.routeAnchors, function(a, b)
         return a.order < b.order or a.order == b.order and a.name < b.name
     end)
+    -- Scan-time geometry probe: raycast consecutive anchor pairs. A door-like
+    -- static blocker between them means the edge starts CLOSED (locked door):
+    -- pre-seed 2 strikes so ONE fresh failure blocks it with the door
+    -- cooldown instead of three. Plain walls/floors mean nothing (levels and
+    -- arenas always break anchor-to-anchor rays) and are NOT recorded.
+    pcall(function()
+        local params = RaycastParams.new()
+        params.FilterType = Enum.RaycastFilterType.Exclude
+        params.FilterDescendantsInstances = state.waypointFolder and { state.waypointFolder } or {}
+        params.IgnoreWater = true
+        params.RespectCanCollide = true
+        for i = 1, #state.routeAnchors - 1 do
+            local a, b = state.routeAnchors[i], state.routeAnchors[i + 1]
+            if a.part.Parent and b.part.Parent then
+                local hit = Workspace:Raycast(a.part.Position, b.part.Position - a.part.Position, params)
+                if hit and hit.Instance:IsA("BasePart") and hit.Instance.CanCollide then
+                    local model = hit.Instance:FindFirstAncestorOfClass("Model")
+                    if not (model and model:FindFirstChildOfClass("Humanoid")) then
+                        if isDoorName(hit.Instance.Name) then
+                            local entry = state.blockedSegments["anchor:" .. tostring(i)] or { fails = 0, blockedUntil = 0 }
+                            entry.fails = math.max(entry.fails, 2)
+                            state.blockedSegments["anchor:" .. tostring(i)] = entry
+                            noteEdgeFail(i)
+                        end
+                    end
+                end
+            end
+        end
+    end)
 end
+
+local function segmentBlocked(key, now)
+    local entry = state.blockedSegments[key]
+    if not entry then return false end
+    if now >= entry.blockedUntil then
+        state.blockedSegments[key] = nil
+        return false
+    end
+    return true
+end
+
+local function recordSegmentFail(key, now, opts)
+    if not state.firstFailedSegment then state.firstFailedSegment = key end
+    state.lastFailedSegment = key
+    local entry = state.blockedSegments[key] or { fails = 0, blockedUntil = 0 }
+    entry.fails = entry.fails + 1
+    -- History seeding: a historically-dead anchor edge starts with 2
+    -- pre-existing strikes, so ONE fresh failure blocks it instead of three.
+    -- Live verification still required every run; history only accelerates.
+    if entry.fails == 1 and key:sub(1, 7) == "anchor:" then
+        local idx = tonumber(key:match("anchor:(%d+)"))
+        if idx and edgeDeadFromHistory(idx) then entry.fails = 3 end
+    end
+    -- Learned costmap: a failed segment teaches the local explorer to avoid
+    -- the ground around both endpoints. Cost 10 per failure, capped at 30,
+    -- decaying after 60s (swept in updateProgress).
+    pcall(function()
+        local tail = key:match(">(-?%d+,-?%d+,-?%d+)$")
+        if tail then
+            local x, _, z = tail:match("(-?%d+),(-?%d+),(-?%d+)")
+            if x and z then
+                local cellKey = math.floor(tonumber(x) / 6) .. ":" .. math.floor(tonumber(z) / 6)
+                local entry2 = state.cellCost[cellKey] or { cost = 0, at = 0 }
+                entry2.cost, entry2.at = math.min(30, entry2.cost + 10), now
+                state.cellCost[cellKey] = entry2
+            end
+        end
+    end)
+    opts = opts or {}
+    local cooldown = opts.door and 60 or CFG.BLOCKED_SEGMENT_COOLDOWN
+    if entry.fails >= CFG.NAV_MAX_REPEATS then
+        entry.blockedUntil = now + cooldown
+        logThreat("blocked-segment", key)
+    end
+    state.blockedSegments[key] = entry
+end
+
+-- First static blocker name on a segment (doors/gates vs plain walls).
+-- Returns nil when the segment is clear or only dynamic bodies block it.
+-- Forward declaration (lexically BEFORE first use): blockingPartName probes
+-- segments with buildRaycastParams, defined further down with hasBlockingRay.
+local buildRaycastParams
+
+local function blockingPartName(origin, destination, character, target)
+    local direction = destination - origin
+    local params = buildRaycastParams(character, target)
+    params.RespectCanCollide = true
+    for _ = 1, 6 do
+        local hit = Workspace:Raycast(origin, direction, params)
+        if not hit then return nil end
+        local instance = hit.Instance
+        local ancestorModel = instance:FindFirstAncestorOfClass("Model")
+        local isHumanoidPart = ancestorModel and ancestorModel:FindFirstChildOfClass("Humanoid") ~= nil
+        if (instance:IsA("BasePart") and not instance.CanCollide) or isHumanoidPart then
+            local ignored = params.FilterDescendantsInstances
+            table.insert(ignored, isHumanoidPart and ancestorModel or instance)
+            params.FilterDescendantsInstances = ignored
+        else
+            return instance.Name
+        end
+    end
+    return "unknown-blocker"
+end
+
+isDoorName = function(name)
+    if type(name) ~= "string" then return false end
+    name = name:lower()
+    return name:find("door", 1, true) or name:find("gate", 1, true)
+        or name:find("barrier", 1, true) or name:find("portcullis", 1, true)
+        or name:find("seal", 1, true)
+end
+
+local function cellCostAt(position, now)
+    local key = math.floor(position.X / 6) .. ":" .. math.floor(position.Z / 6)
+    local entry = state.cellCost[key]
+    if not entry then return 0 end
+    if now - entry.at > 60 then state.cellCost[key] = nil return 0 end
+    return entry.cost
+end
+
+-- Declared before mapRouteGoal so the route checker captures this local
+-- function rather than looking up a nonexistent global at runtime.
+local hasBlockingRay
 
 local function mapRouteGoal(rootPart, now)
     refreshRouteAnchors(now)
@@ -429,12 +841,74 @@ local function mapRouteGoal(rootPart, now)
             anchor = state.routeAnchors[state.routeAnchorIndex]
             if not anchor then return nil end
         end
-        local delta = rootPart.Position - anchor.part.Position
-        local flat = Vector3.new(delta.X, 0, delta.Z).Magnitude
-        if flat <= 28 and math.abs(delta.Y) <= 60 then
-            state.routeAnchorIndex = state.routeAnchorIndex + 1
-        else
+        local key = tostring(state.routeAnchorIndex)
+        -- Arrival catch-up: reaching a LATER checkpoint proves the earlier
+        -- rooms were traversed (linear dungeons route through them), so
+        -- collect every anchor up to the furthest verified one. Position
+        -- verified, never assumed.
+        for lookahead = 1, 2 do
+            local future = state.routeAnchors[state.routeAnchorIndex + lookahead]
+            if not future or not future.part.Parent then break end
+            local fdelta = rootPart.Position - future.part.Position
+            local fflat = Vector3.new(fdelta.X, 0, fdelta.Z).Magnitude
+            if fflat <= CFG.ANCHOR_REACH_FLAT and math.abs(fdelta.Y) <= CFG.ANCHOR_REACH_VERTICAL
+                and not hasBlockingRay(rootPart.Position, future.part.Position, rootPart.Parent, nil) then
+                for _ = 1, lookahead + 1 do
+                    local done = state.routeAnchors[state.routeAnchorIndex]
+                    state.routeAnchorIndex = state.routeAnchorIndex + 1
+                    state.navTransitions = (state.navTransitions or 0) + 1
+                    if done then
+                        table.insert(state.roomHistory, { at = now, room = done.name or "" })
+                        noteTransition(done.name or "")
+                    end
+                end
+                while #state.roomHistory > 40 do table.remove(state.roomHistory, 1) end
+                break
+            end
+        end
+        anchor = state.routeAnchors[state.routeAnchorIndex]
+        if not anchor then return nil end
+        key = tostring(state.routeAnchorIndex)
+        if segmentBlocked("anchor:" .. key, now) then
+            -- A blocked edge is NOT a completed checkpoint. Retain this
+            -- anchor until verified arrival; local path retries are bounded
+            -- separately. Skipping here loses required rooms permanently.
+            -- Skip-AHEAD (not skip-over): when the immediate edge is blocked,
+            -- probe up to 2 anchors forward for an unblocked edge and route
+            -- there instead of ramming the blocked one. The blocked anchor
+            -- stays un-advanced, so its room is still required later: when
+            -- its cooldown expires the tight reach check collects it on the
+            -- way back through. No required room is ever marked complete
+            -- without verified arrival.
+            for lookahead = 1, 2 do
+                local future = state.routeAnchors[state.routeAnchorIndex + lookahead]
+                if not future then break end
+                if not segmentBlocked("anchor:" .. tostring(state.routeAnchorIndex + lookahead), now) then
+                    state.routeSkips = (state.routeSkips or 0) + 1
+                    return future.part.Position + Vector3.new(0, 2.5, 0), future
+                end
+            end
             return anchor.part.Position + Vector3.new(0, 2.5, 0), anchor
+        else
+            local delta = rootPart.Position - anchor.part.Position
+            local flat = Vector3.new(delta.X, 0, delta.Z).Magnitude
+            -- Tight reach check: the old 28-flat/60-vertical window advanced
+            -- the route while the checkpoint was still behind a wall or on
+            -- another floor. Require closeness AND a clear short segment.
+            if flat <= CFG.ANCHOR_REACH_FLAT and math.abs(delta.Y) <= CFG.ANCHOR_REACH_VERTICAL then
+                if not hasBlockingRay(rootPart.Position, anchor.part.Position, rootPart.Parent, nil) then
+                    state.routeAnchorIndex = state.routeAnchorIndex + 1
+                    state.navTransitions = (state.navTransitions or 0) + 1
+                    local room = anchor.name or ""
+                    table.insert(state.roomHistory, { at = now, room = room })
+                    while #state.roomHistory > 40 do table.remove(state.roomHistory, 1) end
+                    noteTransition(room)
+                else
+                    return anchor.part.Position + Vector3.new(0, 2.5, 0), anchor
+                end
+            else
+                return anchor.part.Position + Vector3.new(0, 2.5, 0), anchor
+            end
         end
     end
 end
@@ -471,11 +945,14 @@ local function refreshTargets(rootPart, now)
     state.cachedTargets = targets
 end
 
-local hasBlockingRay
-
 local function getClosestEnemy(rootPart, now)
     refreshTargets(rootPart, now)
-    if now - (state.lastTargetChoice or 0) < 0.15 and isValidTarget(state.lockedTarget) then
+    -- Stable objective: hold the lock briefly so destinations don't thrash.
+    -- When NOTHING is reachable (all candidates behind walls), distances are
+    -- all large and similar, so the lock would flap every 0.15s and every
+    -- in-flight route path would be discarded on arrival. Hold 1.0s instead.
+    local holdWindow = (state.reachableCount == 0) and 1.0 or 0.15
+    if now - (state.lastTargetChoice or 0) < holdWindow and isValidTarget(state.lockedTarget) then
         local root = getRootPart(state.lockedTarget)
         local distance = (rootPart.Position - root.Position).Magnitude
         if distance <= CFG.DETECTION_RADIUS and state.lockedTarget:IsDescendantOf(Workspace) then
@@ -494,34 +971,56 @@ local function getClosestEnemy(rootPart, now)
         end
     end
     table.sort(candidates, function(a, b) return a.distance < b.distance end)
+    -- Reachable-vs-replicated split: raycast visibility is cached per choice
+    -- tick (not per frame) so target selection stays stable while moving.
+    local visible, blocked = {}, {}
+    for _, candidate in ipairs(candidates) do
+        candidate.blocked = hasBlockingRay(rootPart.Position, candidate.root.Position, rootPart.Parent, candidate.model)
+        if candidate.blocked then table.insert(blocked, candidate) else table.insert(visible, candidate) end
+    end
+    state.reachableCount, state.blockedCount = #visible, #blocked
     local closest = candidates[1]
-    local closestIsVisible = false
+    local pick, pickIsVisible = closest, false
     if closest then
-        -- Prefer nearby enemies we can engage over a closer one behind a wall.
+        -- Prefer a reachable enemy over a nearer one behind a wall, but do
+        -- NOT skip a required far objective when nothing reachable exists:
+        -- fall back to the nearest blocked target so the router still drives
+        -- the map graph toward it.
         local searchDistance = math.max(CFG.THREAT_RADIUS, closest.distance + 24)
-        for _, candidate in ipairs(candidates) do
-            if candidate.distance > searchDistance then break end
-            if not hasBlockingRay(rootPart.Position, candidate.root.Position, rootPart.Parent, candidate.model) then
-                closest = candidate
-                closestIsVisible = true
+        for _, candidate in ipairs(visible) do
+            if candidate.distance <= searchDistance then
+                pick, pickIsVisible = candidate, true
                 break
             end
         end
+        if not pickIsVisible then
+            -- No reachable candidate in window: keep the nearest blocked one
+            -- (router will use checkpoints), but flag it for diagnostics.
+            pick, pickIsVisible = closest, false
+        end
     end
     local previousLock = state.lockedTarget
-    state.lockedTarget = closest and closest.model
-    local pickDist = closest and closest.distance or CFG.DETECTION_RADIUS
-    -- Hysteresis: two far targets in opposite directions flip-flop the lock
-    -- every step and the bot paces between them forever. Only switch when the
-    -- challenger is clearly closer or the lock is invalid/gone.
+    state.lockedTarget = pick and pick.model
+    local pickDist = pick and pick.distance or CFG.DETECTION_RADIUS
+    state.lockedVisible = pickIsVisible
+    -- Hysteresis with reachability: a visible challenger within a reasonable
+    -- band beats an invisible lock (prevents staring at a wall while a real
+    -- fight is available). An invisible challenger never steals a visible
+    -- lock on distance alone.
     if previousLock and previousLock ~= state.lockedTarget and isValidTarget(previousLock)
         and previousLock:IsDescendantOf(Workspace) then
         local lockedRoot = getRootPart(previousLock)
         if lockedRoot then
             local lockedDist = (rootPart.Position - lockedRoot.Position).Magnitude
             local lockedVisible = not hasBlockingRay(rootPart.Position, lockedRoot.Position, rootPart.Parent, previousLock)
-            if (not closestIsVisible or lockedVisible) and lockedDist <= pickDist + 20 and lockedDist <= CFG.DETECTION_RADIUS then
+            if lockedVisible and not pickIsVisible and lockedDist <= CFG.DETECTION_RADIUS then
                 state.lockedTarget = previousLock
+                state.lockedVisible = true
+                return previousLock, lockedDist
+            end
+            if (not pickIsVisible or lockedVisible) and lockedDist <= pickDist + 20 and lockedDist <= CFG.DETECTION_RADIUS then
+                state.lockedTarget = previousLock
+                state.lockedVisible = lockedVisible
                 return previousLock, lockedDist
             end
         end
@@ -529,7 +1028,7 @@ local function getClosestEnemy(rootPart, now)
     return state.lockedTarget, pickDist
 end
 
-local function buildRaycastParams(character, target)
+buildRaycastParams = function(character, target)
     local ignored = { character }
     if target then table.insert(ignored, target) end
     if state.waypointFolder then table.insert(ignored, state.waypointFolder) end
@@ -605,6 +1104,64 @@ local function pathKey(startPosition, endPosition, mode)
     return string.format("%s:%d,%d,%d>%d,%d,%d", mode or "combat", quantize(startPosition.X), quantize(startPosition.Y), quantize(startPosition.Z), quantize(endPosition.X), quantize(endPosition.Y), quantize(endPosition.Z))
 end
 
+-- Drop-edge search (measured cause, Aquatic Temple 2026-09-21): objective
+-- significantly below (dy < -8) across a floor gap, direct blocked,
+-- repeated ComputeAsync failures. The game intends a drop point along the
+-- ledge. Traverse perpendicular to the goal bearing probing for a cell
+-- whose floor is >6 below current footing with a clear walk segment;
+-- commit to the nearest such edge. Returns nil when no drop found.
+local function findDropEdge(rootPart, goal, target, now)
+    local toGoal = goal - rootPart.Position
+    if toGoal.Y > -8 then return nil end
+    local flat = Vector3.new(toGoal.X, 0, toGoal.Z)
+    if flat.Magnitude < 6 then return nil end
+    local bearing = math.atan2(toGoal.Z, toGoal.X)
+    local params = buildRaycastParams(rootPart.Parent, target)
+    params.RespectCanCollide = true
+    for _, side in ipairs({ 1, -1 }) do
+        local tangent = Vector3.new(-math.sin(bearing), 0, math.cos(bearing)) * side
+        for _, radius in ipairs({ 8, 16, 24, 32, 40 }) do
+            local candidate = rootPart.Position + tangent * radius
+            candidate = groundPosition(candidate, rootPart.Parent, target)
+            local below = Workspace:Raycast(candidate + Vector3.new(0, 2, 0), Vector3.new(0, -40, 0), params)
+            if below and below.Position.Y < rootPart.Position.Y - 6
+                and walkingSegmentClear(rootPart, candidate, target) then
+                return candidate
+            end
+        end
+    end
+    return nil
+end
+
+-- Wall-slide steering: when a wall is close ahead but the goal lies beyond
+-- it, deflect ±35° and take the side with the longer clear ray. Returns the
+-- goal unchanged when the way is open or no verified side exists. Applied to
+-- planner goals that lack their own collision check (combat orbit holds);
+-- pathfollowed and escape goals already verify their segments.
+local function steerAroundWall(rootPart, goal, target)
+    local toGoal = goal - rootPart.Position
+    local flat = Vector3.new(toGoal.X, 0, toGoal.Z)
+    if flat.Magnitude < 8 then return goal end
+    local dir = flat.Unit
+    local params = buildRaycastParams(rootPart.Parent, target)
+    params.RespectCanCollide = true
+    local origin = rootPart.Position + Vector3.new(0, 2, 0)
+    local hit = Workspace:Raycast(origin, dir * math.min(10, flat.Magnitude), params)
+    if not hit then return goal end
+    local best, bestDist
+    for _, side in ipairs({ 1, -1 }) do
+        local deflected = CFrame.fromAxisAngle(Vector3.yAxis, side * math.rad(35)):VectorToWorldSpace(dir)
+        local probe = Workspace:Raycast(origin, deflected * 12, params)
+        local dist = probe and (probe.Position - rootPart.Position).Magnitude or 12
+        if not bestDist or dist > bestDist then best, bestDist = deflected, dist end
+    end
+    if best and bestDist > 4 then
+        local candidate = groundPosition(rootPart.Position + best * math.min(10, flat.Magnitude), rootPart.Parent, target)
+        if walkingSegmentClear(rootPart, candidate, target) then return candidate end
+    end
+    return goal
+end
+
 local function clearPath()
     state.terrainRecovery = nil
     state.directTravel = false
@@ -619,6 +1176,29 @@ local function clearPath()
     state.pathGoal = nil
     state.pathMode = nil
     clearWaypointVisuals()
+end
+
+-- Movement ownership: exactly one mode drives the Humanoid at a time.
+-- Emergency dodge preempts but preserves the navigation objective so the
+-- global route is NOT erased by a dodge.
+local function setMoveOwner(owner)
+    state.moveOwner = owner
+end
+
+local function saveNavGoal()
+    if state.motionGoal and (state.motionGoalMode == "map-route"
+        or state.motionGoalMode == "approach" or state.motionGoalMode == "combat") then
+        state.savedNavGoal, state.savedNavMode = state.motionGoal, state.motionGoalMode
+    end
+end
+
+local function restoreNavGoal()
+    if state.savedNavGoal then
+        state.motionGoal, state.motionGoalMode = state.savedNavGoal, state.savedNavMode
+        state.savedNavGoal, state.savedNavMode = nil, nil
+        state.lastProgressDistance = math.huge
+        state.lastProgressAt = os.clock()
+    end
 end
 
 local function createPath(startPosition, endPosition, mode, now)
@@ -647,6 +1227,10 @@ local function createPath(startPosition, endPosition, mode, now)
         path:Destroy()
     end
     state.failedPaths[key] = now
+    state.pathFailCount = (state.pathFailCount or 0) + 1
+    -- Record the failed connection so the global router can try a different
+    -- valid route instead of regenerating the same failed path endlessly.
+    recordSegmentFail("path:" .. key, now)
     return nil
 end
 
@@ -713,12 +1297,139 @@ local function issueMove(humanoid, position, mode, now, bypass)
         end
     end
     local changed = state.motionMode ~= mode or (position - state.lastMoveToPosition).Magnitude > 0.75
+    -- Commit guard (anti-jitter): navigation goals re-derive every tick, so
+    -- re-issuing MoveTo for sub-stud wobble fights the humanoid controller.
+    -- Hold the last command 0.3s unless the goal jumped >5 studs. Escapes and
+    -- dodges bypass: they already carry their own commit timing.
+    if not bypass and mode ~= "evade" then
+        local sinceIssue = now - (state.lastIssueAt or -math.huge)
+        local goalJump = (position - (state.lastIssuePos or position)).Magnitude
+        if sinceIssue < 0.3 and goalJump < 5 then
+            state.motionMode = mode
+            return
+        end
+    end
     if changed or now - state.lastMoveToCall >= CFG.MOVETO_REFRESH_INTERVAL then
+        -- Turn counting: consecutive physical goals reversing >90 degrees.
+        -- Refresh re-issues don't count (same direction); only real zigzag.
+        local prev = state.lastMoveVec
+        local vec = position - state.lastMoveToPosition
+        if prev and vec.Magnitude > 1 and prev.Magnitude > 1 then
+            if vec.Unit:Dot(prev.Unit) < 0 then
+                state.moveTurns = (state.moveTurns or 0) + 1
+            end
+        end
+        state.lastMoveVec = vec
+        state.cmdHeading, state.cmdHeadingAt = vec.Magnitude > 1 and vec or nil, now
         humanoid:MoveTo(position)
+        state.moveToCount = (state.moveToCount or 0) + 1
         state.lastMoveToCall = now
         state.lastMoveToPosition = position
+        state.lastIssueAt, state.lastIssuePos = now, position
     end
     state.motionMode = mode
+end
+
+-- Forward declaration: Move.execute consumes emergency teleports, whose
+-- implementation lives with the dodge planners below.
+local performDodgeTeleport
+
+-- Unified movement arbitration: exactly ONE command slot. Navigation,
+-- combat, dodge, and recovery PRODUCE commands via Move.request; only
+-- Move.execute consumes them (single Humanoid:MoveTo site per tick, plus
+-- the emergency teleport path). Priority: emergency (dodge teleports) >
+-- evade (active escapes) > nav (route/approach/combat/recovery/hold).
+-- Equal priority: freshest wins. Lower priority never preempts.
+-- Every decision is inspectable: DQNav.move = source/goal/age/replans/reason.
+local Move = {}
+local MOVE_PRIORITY = { emergency = 3, evade = 2, nav = 1 }
+local MOVE_ARRIVE = { emergency = 2, evade = 2.5, nav = 3 }
+function Move.request(mode, goal, kind, opts)
+    if not goal then return end
+    kind = kind or "nav"
+    opts = opts or {}
+    local source = opts.source or mode
+    local now = os.clock()
+    local current = state.moveCmd
+    local prio = MOVE_PRIORITY[kind] or 1
+    if current and not current.expired then
+        local curPrio = MOVE_PRIORITY[current.kind] or 1
+        if prio < curPrio and now < (current.expiry or math.huge) then
+            state.moveReason = "preempt-denied:" .. source .. "<" .. current.source
+            return false
+        end
+    end
+    if current and current.source == source and current.goal then
+        if (goal - current.goal).Magnitude > 8 then
+            state.moveReplans = (state.moveReplans or 0) + 1
+        end
+    elseif current and (goal - (current.goal or goal)).Magnitude <= 8 then
+        -- Same destination re-filed under a different source (e.g. escape
+        -- carry re-asserting the walk goal): arbitration noise, not a plan
+        -- change. Do not count it.
+    else
+        state.moveReplans = (state.moveReplans or 0) + 1
+    end
+    state.moveCmd = { source = source, mode = mode, goal = goal, kind = kind,
+        at = now, expiry = now + (opts.ttl or 1.5),
+        teleport = opts.teleport, walkGoal = opts.walkGoal,
+        threat = opts.threat, bypass = opts.bypass }
+    state.moveReason = "cmd:" .. source
+    return true
+end
+function Move.execute(humanoid, rootPart, target, now)
+    local cmd = state.moveCmd
+    if not cmd or cmd.consumed then return false end
+    if now >= (cmd.expiry or 0) then
+        cmd.expired = true
+        state.moveReason = "expired:" .. cmd.source
+        state.moveCmd = nil
+        return false
+    end
+    local arriveR = MOVE_ARRIVE[cmd.kind] or 3
+    -- Arrival consumes nav commands (next waypoint/goal), but NEVER evade or
+    -- emergency commands: consuming them on arrival is what caused
+    -- evade->nav->evade flip-flop every tick (stop-start oscillation).
+    -- Escapes persist until expiry while danger re-asserts them each tick.
+    if cmd.kind == "nav" and (cmd.goal - rootPart.Position).Magnitude <= arriveR then
+        cmd.consumed = true
+        state.moveReason = "arrived:" .. cmd.source
+        state.moveCmd = nil
+        return true
+    end
+    -- Unified hazard gate: non-emergency commands never walk INTO danger.
+    -- Evades bypass (they were planned with survival margins); emergencies
+    -- bypass (teleport validity checked separately).
+    if cmd.kind == "nav" and CFG.AUTO_DODGE and #state.activeZones > 0 then
+        local minClear = math.huge
+        for _, zone in ipairs(state.activeZones) do
+            minClear = math.min(minClear, ThreatGeometry.clearance(zone, cmd.goal, CFG.HAZARD_MARGIN))
+        end
+        if minClear < -2 then
+            state.moveReason = "goal-in-danger:" .. cmd.source
+            humanoid:MoveTo(rootPart.Position)
+            state.motionMode = "safety-hold"
+            return true
+        end
+    end
+    if cmd.teleport then
+        if performDodgeTeleport(humanoid, rootPart, cmd.goal, target, cmd.threat or "move", now) then
+            cmd.consumed = true
+            state.moveCmd = nil
+            return true
+        end
+        -- Teleport denied (budget/cooldown/geometry): walk the full goal the
+        -- blink was covering instead of stopping at the partial step.
+        cmd.teleport = nil
+        if cmd.walkGoal then cmd.goal = cmd.walkGoal end
+        state.moveReason = "teleport-denied:" .. cmd.source
+    end
+    issueMove(humanoid, cmd.goal, cmd.mode or (cmd.kind == "evade" and "evade" or "nav"), now, cmd.bypass)
+    return true
+end
+function Move.clear(reason)
+    state.moveCmd = nil
+    state.moveReason = reason or "cleared"
 end
 
 local function chooseFallbackStep(rootPart, goal, target)
@@ -726,24 +1437,57 @@ local function chooseFallbackStep(rootPart, goal, target)
     local forward = Vector3.new(delta.X, 0, delta.Z)
     if forward.Magnitude < 0.1 then forward = Vector3.new(1, 0, 0) end
     forward = forward.Unit
-    local directions = {
-        forward, Vector3.new(-forward.Z, 0, forward.X), Vector3.new(forward.Z, 0, -forward.X),
-        -forward, (forward + Vector3.new(-forward.Z, 0, forward.X)).Unit,
-        (forward + Vector3.new(forward.Z, 0, -forward.X)).Unit,
-    }
-    local best, bestScore
-    state.fallbackVisits = state.fallbackVisits or {}
     local now = os.clock()
-    for key, at in pairs(state.fallbackVisits) do if now - at > 15 then state.fallbackVisits[key] = nil end end
-    for _, direction in ipairs(directions) do
-        local candidate = groundPosition(rootPart.Position + direction * 8, rootPart.Parent, target)
-        if walkingSegmentClear(rootPart, candidate, target) then
-            local key = math.floor(candidate.X / 6) .. ":" .. math.floor(candidate.Z / 6)
-            local score = (candidate - goal).Magnitude + (state.fallbackVisits[key] and 40 or 0)
-            if not bestScore or score < bestScore then best, bestScore = candidate, score end
+    state.fallbackVisits = state.fallbackVisits or {}
+    state.fallbackStreak = (state.fallbackStreak or 0) + 1
+    for key, sample in pairs(state.fallbackVisits) do
+        if now - sample.at > 60 then state.fallbackVisits[key] = nil end
+    end
+    -- Escalating radii: repeated failures search wider instead of re-stepping
+    -- the same 8-stud circle. Bounded at 20 studs per step (walking only,
+    -- never a blink); streak resets on verified progress in updateProgress.
+    local radii = state.fallbackStreak >= 6 and { 8, 14, 20 }
+        or state.fallbackStreak >= 3 and { 8, 14 } or { 8 }
+    local best, bestScore
+    -- Current heading: prefer the last COMMANDED direction (physics
+    -- velocity is often unreadable from executor context). Reversing the
+    -- committed heading reads as zigzag; penalize hard reversals so the fan
+    -- commits to a side instead of ping-ponging every step.
+    local heading = state.cmdHeading and (os.clock() - state.cmdHeadingAt < 1.0)
+        and state.cmdHeading or nil
+    if not heading then
+        local vel = rootPart.AssemblyLinearVelocity
+        heading = (vel.Magnitude > 2 and Vector3.new(vel.X, 0, vel.Z)) or nil
+    end
+    for _, radius in ipairs(radii) do
+        for index = 0, 7 do
+            local angle = index * math.pi / 4
+            local direction = CFrame.fromAxisAngle(Vector3.new(0, 1, 0), angle):VectorToWorldSpace(forward)
+            local candidate = groundPosition(rootPart.Position + direction * radius, rootPart.Parent, target)
+            if walkingSegmentClear(rootPart, candidate, target) then
+                local key = math.floor(candidate.X / 6) .. ":" .. math.floor(candidate.Z / 6)
+                local visits = state.fallbackVisits[key]
+                local visitPenalty = visits and math.min(120, visits.count * 25) or 0
+                -- Goal bias with forward preference: candidates toward the goal
+                -- win ties, so exploration drifts around walls instead of away.
+                local score = (candidate - goal).Magnitude
+                    + visitPenalty
+                    + cellCostAt(candidate, now) * 2
+                    - math.max(0, direction:Dot(forward)) * radius * 0.5
+                if heading and heading.Magnitude > 0.1
+                    and direction:Dot(heading.Unit) < -0.3 then
+                    score = score + 30
+                end
+                if not bestScore or score < bestScore then best, bestScore = candidate, score end
+            end
         end
     end
-    if best then state.fallbackVisits[math.floor(best.X / 6) .. ":" .. math.floor(best.Z / 6)] = now end
+    if best then
+        local key = math.floor(best.X / 6) .. ":" .. math.floor(best.Z / 6)
+        local visits = state.fallbackVisits[key] or { count = 0, at = 0 }
+        visits.count, visits.at = visits.count + 1, now
+        state.fallbackVisits[key] = visits
+    end
     return best
 end
 
@@ -809,6 +1553,12 @@ end
 
 local function followGoal(humanoid, rootPart, goal, mode, now, target)
     if not goal then return end
+    -- Ownership mapping: global route vs local approach vs combat vs recovery.
+    -- Stable objective: only replan on reached / invalid / obstacle / stall.
+    if mode == "map-route" then setMoveOwner("GLOBAL_NAVIGATION")
+    elseif mode == "approach" then setMoveOwner("LOCAL_NAVIGATION")
+    elseif mode == "combat" then setMoveOwner("COMBAT_MOVEMENT")
+    elseif mode == "terrain-recovery" or mode == "recovery" then setMoveOwner("RECOVERY") end
     -- Flying targets bob up and down; a climb goal set during an upward bob
     -- goes stale when the target comes back down. Drop it instead of pacing
     -- between tiers.
@@ -842,13 +1592,18 @@ local function followGoal(humanoid, rootPart, goal, mode, now, target)
     if state.terrainRecovery and #state.waypoints > 0 then
         goal, mode = state.terrainRecovery, "terrain-recovery"
     end
-    local newGoal = not state.motionGoal or (state.motionGoal - goal).Magnitude > 2 or state.motionGoalMode ~= mode
+    -- Stable objective with mode-dependent hysteresis: combat orbits jitter
+    -- every tick, so require a larger move before replanning. Only replan
+    -- when the objective is reached, invalid, or meaningfully moved.
+    local replanDist = mode == "combat" and 8 or (mode == "approach" and 5 or 3)
+    local newGoal = not state.motionGoal or (state.motionGoal - goal).Magnitude > replanDist or state.motionGoalMode ~= mode
     if newGoal then
         state.motionGoal, state.motionGoalMode = goal, mode
         state.fallbackGoal, state.fallbackUntil = nil, 0
         if state.pathMode and state.pathMode ~= mode then clearPath() end
         state.lastProgressDistance = math.huge
         state.lastProgressAt = now
+        state.navGoalKey, state.navBestDist, state.navBestAt = nil, (goal - rootPart.Position).Magnitude, now
     end
 
     -- Keep a short collision-checked escape step active between path attempts.
@@ -856,7 +1611,7 @@ local function followGoal(humanoid, rootPart, goal, mode, now, target)
     -- corner from leaving the Humanoid idle while the long path is retried.
     if state.fallbackGoal and now < state.fallbackUntil then
         if (rootPart.Position - state.fallbackGoal).Magnitude > CFG.WAYPOINT_REACH_THRESHOLD then
-            issueMove(humanoid, state.fallbackGoal, mode, now)
+            Move.request(mode, state.fallbackGoal, "nav", { source = "fallback-carry" })
             return
         end
         state.fallbackGoal, state.fallbackUntil = nil, 0
@@ -871,14 +1626,41 @@ local function followGoal(humanoid, rootPart, goal, mode, now, target)
             state.directProbe = probe
         end
         if probe.clear then
+            state.directUnclearStreak = 0
             if not state.directTravel then clearPath() end
             state.directTravel, state.pathMode = true, mode
             state.pathStatus = "Pathfinding: direct walk"
-            issueMove(humanoid, goal, mode, now)
+            Move.request(mode, goal, "nav", { source = "direct" })
             return
+        else
+            -- Hysteresis: one unclear sample (marginal geometry, moving mob)
+            -- must not kill direct travel. Two consecutive unclear probes
+            -- before falling through to pathfinding.
+            state.directUnclearStreak = (state.directUnclearStreak or 0) + 1
+            if state.directUnclearStreak < 2 and state.directTravel then
+                state.pathStatus = "Pathfinding: direct walk"
+                Move.request(mode, goal, "nav", { source = "direct" })
+                return
+            end
         end
     end
     state.directTravel = false
+
+    -- Elevated goal on foot: the flat navmesh route walks underneath and never
+    -- climbs. Survey the uphill transect for a stair/ramp base first and chain
+    -- it as the immediate step (cheap raycasts, no ComputeAsync). Was dead
+    -- code; now runs before every expensive repath for map-route/approach.
+    if (mode == "map-route" or mode == "approach")
+        and goal.Y > rootPart.Position.Y + 6
+        and now - (state.lastSurveyAt or -math.huge) >= 2 then
+        state.lastSurveyAt = now
+        local stairBase = surveyUphill(rootPart, goal)
+        if stairBase and (stairBase - rootPart.Position).Magnitude > CFG.WAYPOINT_REACH_THRESHOLD then
+            state.fallbackGoal, state.fallbackUntil = stairBase, now + 2.0
+            Move.request(mode, stairBase, "nav", { source = "stairs" })
+            return
+        end
+    end
 
     local shouldRepath = state.pathBlocked or #state.waypoints == 0 or not state.pathGoal or (goal - state.pathGoal).Magnitude > 12
     if shouldRepath and not state.pathPending and now - state.pathUpdateTime >= CFG.PATH_UPDATE_INTERVAL and (goal - rootPart.Position).Magnitude > CFG.WAYPOINT_REACH_THRESHOLD then
@@ -902,8 +1684,9 @@ local function followGoal(humanoid, rootPart, goal, mode, now, target)
             return
         end
         if state.closed or not state.running or humanoid.Health <= 0 or generation ~= state.pathGeneration
-            or player.Character ~= rootPart.Parent or not target.Parent
-            or not state.motionGoal or (state.motionGoal - goal).Magnitude > 8 then
+            or player.Character ~= rootPart.Parent
+            or (mode ~= "map-route" and (not target.Parent or not state.motionGoal
+                or (state.motionGoal - goal).Magnitude > 8)) then
             if path then path:Destroy() end
             return
         end
@@ -955,18 +1738,21 @@ local function followGoal(humanoid, rootPart, goal, mode, now, target)
     end
 
     local waypoint = state.waypoints[state.currentWaypointIndex]
-    -- Watchdog: a waypoint we fail to close on for 4s is skipped, not rammed
-    -- forever. Deterministic repaths regenerate the same stuck point, so
-    -- skipping is what breaks the loop. Progress refreshes the window.
+    -- A stalled waypoint is evidence that this local path segment is stale or
+    -- invalid. Do not skip it: the next waypoint can be behind the same wall
+    -- or on a disconnected floor. Invalidate the path and let the bounded
+    -- recovery/replan flow choose a verified segment.
     if waypoint then
         local flatDist = (Vector3.new(rootPart.Position.X - waypoint.Position.X, 0, rootPart.Position.Z - waypoint.Position.Z)).Magnitude
         if state.watchWp ~= waypoint then
             state.watchWp, state.watchSince, state.watchDist, state.watchSkips = waypoint, now, flatDist, 0
-        elseif now - state.watchSince >= 4 and flatDist > state.watchDist - 1 and (state.watchSkips or 0) < 4 then
-            state.watchSkips = (state.watchSkips or 0) + 1
-            state.currentWaypointIndex = state.currentWaypointIndex + 1
+        elseif now - state.watchSince >= 4 and flatDist > state.watchDist - 1 then
+            recordSegmentFail("waypoint:" .. pathKey(rootPart.Position, waypoint.Position, mode), now)
+            state.pathBlocked = true
             state.watchWp, state.watchSince = nil, 0
-            waypoint = state.waypoints[state.currentWaypointIndex]
+            clearPath()
+            state.pathStatus = "Pathfinding: stalled segment, replanning"
+            return
         elseif flatDist < state.watchDist - 1 then
             state.watchSince, state.watchDist = now, flatDist
         end
@@ -988,9 +1774,25 @@ local function followGoal(humanoid, rootPart, goal, mode, now, target)
         if #state.waypoints > 0 then clearPath() end
         if (goal - rootPart.Position).Magnitude <= CFG.DIRECT_PATH_DISTANCE
             and walkingSegmentClear(rootPart, goal, target) then
-            issueMove(humanoid, goal, mode, now)
+            Move.request(mode, goal, "nav", { source = "path-exhausted" })
         else
-            if now - (state.lastPendingStep or -math.huge) >= 0.2 then
+            -- Drop signature: objective below across a gap with repeated
+            -- failures — search the ledge for the intended drop point and
+            -- commit (4s TTL) instead of shuffling fallback steps.
+            local dropEdge = nil
+            if goal.Y - rootPart.Position.Y < -8 then
+                local gkey = string.format("%d,%d,%d",
+                    math.floor(goal.X / 4), math.floor(goal.Y / 4), math.floor(goal.Z / 4))
+                local gfails = state.blockedSegments["goal:" .. gkey]
+                if gfails and gfails.fails >= 2 then
+                    dropEdge = findDropEdge(rootPart, goal, target, now)
+                end
+            end
+            if dropEdge then
+                state.fallbackGoal, state.fallbackUntil = dropEdge, now + 4.0
+                state.pathStatus = "Pathfinding: drop edge search"
+                Move.request(mode, dropEdge, "nav", { source = "drop-edge", ttl = 4.0 })
+            elseif now - (state.lastPendingStep or -math.huge) >= 0.2 then
                 state.lastPendingStep = now
                 local fallback = chooseFallbackStep(rootPart, goal, target)
                 if fallback then
@@ -998,9 +1800,9 @@ local function followGoal(humanoid, rootPart, goal, mode, now, target)
                         state.routeFails = (state.routeFails or 0) + 1
                     end
                     state.fallbackGoal, state.fallbackUntil = fallback, now + 0.6
-                    issueMove(humanoid, fallback, mode, now)
+                    Move.request(mode, fallback, "nav", { source = "pending-step" })
                 else
-                    humanoid:MoveTo(rootPart.Position)
+                    Move.request(mode, rootPart.Position, "nav", { source = "hold-nostep", ttl = 0.4 })
                 end
             end
         end
@@ -1015,12 +1817,26 @@ local function followGoal(humanoid, rootPart, goal, mode, now, target)
         local fallback = chooseFallbackStep(rootPart, goal, target)
         if fallback then
             state.fallbackGoal, state.fallbackUntil = fallback, now + 1.6
-            issueMove(humanoid, fallback, mode, now)
+            Move.request(mode, fallback, "nav", { source = "stale-segment" })
         end
         return
     end
     if waypoint.Action == Enum.PathWaypointAction.Jump and humanoid.FloorMaterial ~= Enum.Material.Air then humanoid.Jump = true end
-    issueMove(humanoid, waypoint.Position, mode, now)
+    -- Waypoint lookahead: when the next waypoint is close behind this one and
+    -- the segment to it is clear, aim at the further one instead of
+    -- stop-starting on every navmesh node. Cuts direction changes on open
+    -- ground without cutting corners through walls.
+    do
+        local nextWp = state.waypoints[state.currentWaypointIndex + 1]
+        if nextWp and (nextWp.Position - waypoint.Position).Magnitude <= 10
+            and not hasBlockingRay(rootPart.Position + Vector3.new(0, 2, 0),
+                nextWp.Position + Vector3.new(0, 2, 0), rootPart.Parent, target) then
+            waypoint = nextWp
+            state.currentWaypointIndex = state.currentWaypointIndex + 1
+            updateWaypointHighlight(state.currentWaypointIndex)
+        end
+    end
+    Move.request(mode, waypoint.Position, "nav", { source = "waypoint" })
 end
 
 local function chooseRecoveryGoal(rootPart, goal, target)
@@ -1038,26 +1854,71 @@ local function chooseRecoveryGoal(rootPart, goal, target)
         candidate = groundPosition(candidate, rootPart.Parent, target)
         if walkingSegmentClear(rootPart, candidate, target) then return candidate end
     end
+    -- Fully boxed in: teach the costmap this cell is dead ground so the next
+    -- exploration fan routes around it instead of back into it.
+    do
+        local key = math.floor(rootPart.Position.X / 6) .. ":" .. math.floor(rootPart.Position.Z / 6)
+        local entry = state.cellCost[key] or { cost = 0, at = 0 }
+        entry.cost, entry.at = math.min(30, entry.cost + 10), os.clock()
+        state.cellCost[key] = entry
+    end
     return nil
 end
 
 local function updateProgress(humanoid, rootPart, goal, target, now)
     if now - state.lastStuckCheck < CFG.STUCK_CHECK_INTERVAL then return false end
     state.lastStuckCheck = now
+    -- Decay sweep (~every 5s): forget dead ground so old failures never
+    -- permanently fence off an area whose door has since opened.
+    if now - (state.lastCostSweep or -math.huge) >= 5 then
+        state.lastCostSweep = now
+        for key, entry in pairs(state.cellCost) do
+            if now - entry.at > 60 then state.cellCost[key] = nil end
+        end
+    end
     local distance = (goal - rootPart.Position).Magnitude
-    local moved = (rootPart.Position - state.lastPosition).Magnitude
-    state.lastPosition = rootPart.Position
-    if moved >= CFG.STUCK_MOVE_THRESHOLD or distance < state.lastProgressDistance - 0.25 then
+    -- Track the active objective key: a new goal resets best-distance memory.
+    local key = string.format("%d,%d,%d", math.floor(goal.X / 4), math.floor(goal.Y / 4), math.floor(goal.Z / 4))
+    if state.navGoalKey ~= key then
+        state.navGoalKey, state.navBestDist, state.navBestAt = key, distance, now
+        state.navSamples, state.navLoopCount = {}, 0
+        state.lastVerifiedProgressAt = state.lastVerifiedProgressAt or now
+    end
+    -- Loop memory: quantized positions over ~12s; revisits without goal
+    -- progress indicate circling, not advancement.
+    do
+        local cell = math.floor(rootPart.Position.X / 6) .. ":" .. math.floor(rootPart.Position.Z / 6)
+        table.insert(state.navSamples, { at = now, cell = cell })
+        while state.navSamples[1] and now - state.navSamples[1].at > 12 do table.remove(state.navSamples, 1) end
+        local visits = 0
+        for _, sample in ipairs(state.navSamples) do
+            if sample.cell == cell then visits = visits + 1 end
+        end
+        if visits >= 6 then state.navLoopCount = (state.navLoopCount or 0) + 1 end
+    end
+    -- TRUE progress: only distance-to-goal reduction counts. Sideways drift
+    -- (moved >= threshold with no goal gain) does NOT reset the detector.
+    if distance < state.navBestDist - CFG.NAV_PROGRESS_EPS then
+        state.navBestDist, state.navBestAt = distance, now
+        state.lastVerifiedProgressAt = now
         state.stuckCount = 0
         state.stuckStartTime = 0
         state.lastProgressDistance = distance
         state.lastProgressAt = now
         state.routeFails = 0
+        state.navLoopCount = 0
+        -- Verified progress resets the exploration streak: the wider radii
+        -- were for the old blockage, not the new ground.
+        state.fallbackStreak = 0
+        state.doorHold = nil
+        state.lastPosition = rootPart.Position
         return false
     end
+    state.lastPosition = rootPart.Position
+    state.lastProgressDistance = math.min(state.lastProgressDistance, distance)
     state.stuckCount = state.stuckCount + 1
     if state.stuckStartTime == 0 then state.stuckStartTime = now end
-    if now - state.stuckStartTime < CFG.STUCK_TIMEOUT then return false end
+    if now - state.stuckStartTime < CFG.STUCK_TIMEOUT and (state.navLoopCount or 0) < 2 then return false end
     -- Rate-limit recoveries: chained lateral hops every 0.75s read as
     -- oscillation. One committed recovery per 2s, then keep walking it.
     if now - (state.lastRecoveryAt or -math.huge) < 2 then return true end
@@ -1067,14 +1928,51 @@ local function updateProgress(humanoid, rootPart, goal, target, now)
     state.stuckStartTime = now
     state.stuckCount = 0
     state.routeFails = (state.routeFails or 0) + 1
+    if state.telemetry then
+        state.telemetry.recoveries = state.telemetry.recoveries + 1
+        state.telemetry.stuckEvents = state.telemetry.stuckEvents + 1
+        state.telemetry.noProgressSec = state.telemetry.noProgressSec
+            + math.max(0, now - (state.telemetry.lastNoProgAt or state.telemetry.startedAt))
+        state.telemetry.lastNoProgAt = now
+    end
     -- NOTE: no clearPath() here. Clearing bumps the path generation, which
     -- discards the in-flight repath result, which stalls again, which clears
     -- again: a permanent loop where no path ever survives to be walked.
     -- Keep the current path; the Blocked event repaths if truly blocked.
+    -- 3-strike rule: after 3 failed recoveries for the SAME quantized goal,
+    -- record the blocked segment and stop retrying it unchanged.
+    if state.navGoalKey then
+        local entry = state.blockedSegments["goal:" .. state.navGoalKey] or { fails = 0, blockedUntil = 0 }
+        entry.fails = entry.fails + 1
+        if entry.fails >= CFG.NAV_MAX_REPEATS then
+            entry.blockedUntil = now + CFG.BLOCKED_SEGMENT_COOLDOWN
+            logThreat("blocked-goal", state.navGoalKey)
+            state.pathStatus = "Pathfinding: segment blocked, holding for re-probe"
+            state.blockedSegments["goal:" .. state.navGoalKey] = entry
+            -- Map-route goals also mark their anchor edge blocked so the
+            -- global router skips that checkpoint until cooldown expires.
+            -- A door-like blocker earns the 60s door cooldown and a named
+            -- hold status instead of the generic re-probe loop.
+            if state.motionGoalMode == "map-route" then
+                local blocker = state.motionGoal and blockingPartName(
+                    rootPart.Position, state.motionGoal, rootPart.Parent, target) or nil
+                if isDoorName(blocker) then
+                    state.doorHold = blocker
+                    state.pathStatus = "Holding for door: " .. blocker
+                    recordSegmentFail("anchor:" .. tostring(state.routeAnchorIndex), now, { door = true })
+                else
+                    recordSegmentFail("anchor:" .. tostring(state.routeAnchorIndex), now)
+                end
+                noteEdgeFail(state.routeAnchorIndex)
+            end
+            return true
+        end
+        state.blockedSegments["goal:" .. state.navGoalKey] = entry
+    end
     local recovery = chooseRecoveryGoal(rootPart, goal, target)
     if recovery then
         state.fallbackGoal, state.fallbackUntil = recovery, now + 1.6
-        issueMove(humanoid, recovery, "recovery", now)
+        Move.request("recovery", recovery, "nav", { source = "stuck-recovery" })
         state.pathStatus = "Pathfinding: lateral recovery"
     end
     return true
@@ -1250,19 +2148,81 @@ local function refreshSafety(rootPart, now)
         if not loggedThreats[zone.id] then
             loggedThreats[zone.id] = true
             local fp = zone.frame.Position
+            local zoneName = typeof(zone.id) == "Instance" and zone.id:GetFullName() or ("announced:" .. tostring(zone.name or zone.shape))
             logThreat("zone", {
-                name = typeof(zone.id) == "Instance" and zone.id:GetFullName() or ("announced:" .. tostring(zone.name or zone.shape)),
+                name = zoneName,
                 shape = zone.shape,
                 zat = string.format("%d,%d,%d", math.floor(fp.X), math.floor(fp.Y), math.floor(fp.Z)),
                 size = tostring(zone.size),
             })
+            -- Attack observation: boss + telegraph identity, warning age,
+            -- danger geometry, player/boss positions at warning time.
+            -- Verified sightings feed the deterministic pattern DB (trusted
+            -- after 3 samples). Movement response + damage linkage are added
+            -- by the tracking update below and the damage handler.
+            pcall(function()
+                local boss = state.currentTarget and state.currentTarget.Name or "unknown"
+                local attackId = typeof(zone.id) == "Instance" and zone.id.Name or tostring(zone.name or zone.shape)
+                local sample = typeof(zone.id) == "Instance" and threatParts[zone.id]
+                local warnAge = sample and math.max(0, now - sample.createdAt) or 0
+                local bossRoot = state.currentTarget and getRootPart(state.currentTarget)
+                observeAttack(boss, attackId, warnAge, zone.size and zone.size.Magnitude or 0, {
+                    tracksPlayer = zone.moving == true,
+                    fixedLocation = zone.moving == false,
+                    arenaPattern = zone.shape == "ProtectorSmash",
+                    shape = zone.shape,
+                    warnPos = quantizePos(fp),
+                    playerPos = quantizePos(rootPart.Position),
+                    bossPos = bossRoot and quantizePos(bossRoot.Position) or nil,
+                })
+            end)
         end
+        -- Per-scan tracking vote: does this warning follow the player or sit
+        -- fixed? Votes accumulate into the pattern entry; the majority label
+        -- (player-anchored / tracking / fixed) is stored, never guessed.
+        pcall(function()
+            if typeof(zone.id) == "Instance" then
+                local sample = threatParts[zone.id]
+                if sample then
+                    local bossRoot = state.currentTarget and getRootPart(state.currentTarget)
+                    local vote = updateAttackTracking(sample, zone, rootPart, bossRoot, now)
+                    if vote then
+                        local boss = state.currentTarget and state.currentTarget.Name or "unknown"
+                        local attackId = zone.id.Name
+                        observeAttack(boss, attackId, 0, zone.size and zone.size.Magnitude or 0, {
+                            targeting = vote,
+                            shape = zone.shape,
+                            warnPos = quantizePos(zone.frame.Position),
+                            playerPos = quantizePos(rootPart.Position),
+                            bossPos = bossRoot and quantizePos(bossRoot.Position) or nil,
+                        })
+                    end
+                end
+            end
+        end)
+        -- Prediction: when a KNOWN warning reappears, bias the escape search
+        -- by treating its predicted size as the minimum danger radius. The
+        -- lookup is cheap (trusted patterns only); unknown attacks fall back
+        -- to reactive geometry with no false confidence.
+        pcall(function()
+            local boss = state.currentTarget and state.currentTarget.Name or "unknown"
+            local attackId = typeof(zone.id) == "Instance" and zone.id.Name or tostring(zone.name or zone.shape)
+            local predicted = predictAttack(boss, attackId)
+            if predicted and predicted.trusted then
+                zone.predictedWarn = predicted.warnAvg
+                zone.predictedSize = predicted.sizeAvg
+            end
+        end)
     end
 end
 
 local function crowdDistance(position)
     return math.min(28, enemyClearance(position) + math.clamp(CFG.COMBAT_MIN_DISTANCE, 6, 22))
 end
+
+-- Forward declaration: defined with the windup detector below; escape
+-- planning (above) keys smash-geometry behavior off it.
+local smashZonesActive
 
 local function findEscapeGoal(rootPart, targetRoot)
     local params = buildRaycastParams(rootPart.Parent, targetRoot.Parent)
@@ -1287,7 +2247,7 @@ local function findEscapeGoal(rootPart, targetRoot)
         local desiredError = math.abs(targetDistance - CFG.COMBAT_DISTANCE)
         return orbitAlignment * 18 - outward * 24 - desiredError * 2, targetDistance
     end
-    if targetRoot.Parent.Name == "Ancient Temple Protector" then
+    if targetRoot.Parent.Name == "Ancient Temple Protector" or smashZonesActive() then
         local toward = targetRoot.Position - rootPart.Position
         toward = Vector3.new(toward.X, 0, toward.Z)
         local originalDistance = toward.Magnitude
@@ -1345,7 +2305,10 @@ local function findEscapeGoal(rootPart, targetRoot)
     end
     local originalCrowd = crowdDistance(rootPart.Position)
     local originalDist = (rootPart.Position - targetRoot.Position).Magnitude
-    local isProt = targetRoot.Parent and targetRoot.Parent.Name == "Ancient Temple Protector"
+    -- Smash-geometry behavior (was Protector-name-gated): dodge FORWARD,
+    -- never back, when expanding slam walls are on the field. Retreating
+    -- from a slam just sets up the next volley at range.
+    local isProt = smashZonesActive()
     -- Young smash corridors: exit strictly sideways. Generic gradient steps
     -- waste the ~1s windup on diagonals that never leave the corridor.
     do
@@ -1394,8 +2357,12 @@ local function findEscapeGoal(rootPart, targetRoot)
                     and safeEnemyStep(rootPart.Position, candidate) then
                     local survivalRisk = ThreatGeometry.risk(state.activeZones, candidate, 2)
                     local comfortRisk = ThreatGeometry.risk(state.activeZones, candidate, CFG.HAZARD_MARGIN)
+                    -- Trusted-pattern forecast: predicted danger size expands
+                    -- beyond the live part before activation. Prefer exits
+                    -- that stay clear of the predicted footprint too.
+                    local forecastRisk = predictedRisk(state.activeZones, candidate, CFG.HAZARD_MARGIN)
                     local shapeScore, targetDistance = combatShapeScore(candidate)
-                    local score = survivalRisk * 10000 + comfortRisk * 100 + distance - shapeScore
+                    local score = survivalRisk * 10000 + comfortRisk * 100 + forecastRisk * 500 + distance - shapeScore
                         + math.max(0, targetDistance - math.max(CFG.ATTACK_RANGE, originalTargetDistance + 4)) * 500
                     if ThreatGeometry.segmentSafe(state.activeZones, rootPart.Position, candidate, 2)
                         and (not bestScore or score < bestScore) then
@@ -1458,6 +2425,11 @@ local function findEscapeGoal(rootPart, targetRoot)
                 local backOk = targetDistance <= backLimit
                 local risk = ThreatGeometry.risk(state.activeZones, candidate, CFG.HAZARD_MARGIN)
                 local crowd = crowdDistance(candidate)
+                -- Forecast penalty: trusted patterns count extra so escapes
+                -- pre-position outside the predicted footprint while staying
+                -- on the attack-range leash (backOk below). Unknown attacks
+                -- contribute zero (fallback = reactive geometry only).
+                local forecast = predictedRisk(state.activeZones, candidate, CFG.HAZARD_MARGIN)
                 local hazardClearance = 12
                 for _, activeZone in ipairs(state.activeZones) do
                     hazardClearance = math.min(hazardClearance, ThreatGeometry.clearance(activeZone, candidate, CFG.HAZARD_MARGIN))
@@ -1468,7 +2440,7 @@ local function findEscapeGoal(rootPart, targetRoot)
                 if backOk and (originalRisk == 0 or risk < originalRisk - 0.1) and crowdOk then
                     local desiredDistance = CFG.COMBAT_DISTANCE + (state.retreating and CFG.RETREAT_RELEASE_MARGIN or 0)
                     local shapeScore = combatShapeScore(candidate)
-                    local score = -risk * 1000 + math.min(hazardClearance, 12) + math.min(crowd, 28)
+                    local score = -risk * 1000 - forecast * 500 + math.min(hazardClearance, 12) + math.min(crowd, 28)
                         - radius * 2 - math.abs(targetDistance - desiredDistance)
                         - math.max(0, targetDistance - CFG.ATTACK_RANGE) * 4
                         + shapeScore
@@ -1618,7 +2590,7 @@ local function effectiveSpellRange(profile)
     return profile.range or (CFG.SPELL_RANGE_OVERRIDE > 0 and CFG.SPELL_RANGE_OVERRIDE) or CFG.ATTACK_RANGE
 end
 
-local function performDodgeTeleport(humanoid, rootPart, destination, target, threat, now)
+performDodgeTeleport = function(humanoid, rootPart, destination, target, threat, now)
     if not destination or humanoid.FloorMaterial == Enum.Material.Air then return false end
     local delta = destination - rootPart.Position
     if not canTeleportDodge(now, delta.Magnitude, threat) then return false end
@@ -1632,11 +2604,16 @@ local function performDodgeTeleport(humanoid, rootPart, destination, target, thr
     rootPart.CFrame = rootPart.CFrame + delta
     table.insert(state.dodgeHistory, { at = now, distance = delta.Magnitude })
     logThreat("tp", { distance = math.floor(delta.Magnitude * 10) / 10 })
+    if state.telemetry then state.telemetry.dodges = state.telemetry.dodges + 1 end
     state.lastDodgeTime = now
     state.safetyUntil = now + 0.75
     state.dodgeCount = state.dodgeCount + 1
+    -- Preserve the global route across a tactical blink: stash the nav goal
+    -- first so it can be restored when the danger passes. Only the local
+    -- path is cleared, never the checkpoint index.
+    if state.moveOwner ~= "EMERGENCY_DODGE" then saveNavGoal() end
+    setMoveOwner("EMERGENCY_DODGE")
     clearPath()
-    state.motionGoal = nil
     state.fallbackGoal, state.fallbackUntil = nil, 0
     humanoid:MoveTo(destination)
     state.motionMode = "dodge"
@@ -1768,6 +2745,9 @@ local function castSkill()
 end
 
 local function stopMovement(humanoid, rootPart)
+    -- Always drop the pending command first: a stale goal must never
+    -- re-issue after a halt, even when the halt itself is redundant.
+    Move.clear("stop")
     if state.motionMode == "hold" and not state.motionGoal then return end
     humanoid:MoveTo(rootPart.Position)
     state.motionMode = "hold"
@@ -1779,9 +2759,17 @@ end
 -- Protector windup tell: hands rest at body level; a fast raise starts the
 -- smash volley. A freshly started animation track on the boss counts too.
 -- So does the boss snapping to face the player (the slam aims at whoever it
--- faces). Returns true on the tick the tell is detected.
+-- faces). Boss-agnostic: any boss can produce these tells (hand-raise only
+-- applies when hand models exist). Returns true on the tick detected.
+local function smashZonesActiveImpl()
+    for _, zone in ipairs(state.activeZones) do
+        if zone.shape == "ProtectorSmash" then return true end
+    end
+    return false
+end
+smashZonesActive = smashZonesActiveImpl
 local function protectorWindup(target, targetRoot, rootPart, now)
-    if not target or target.Name ~= "Ancient Temple Protector" then
+    if not target then
         state.windHands, state.windTracks, state.faceHist = nil, nil, nil
         return false
     end
@@ -1850,12 +2838,16 @@ local function meleeThreat(rootPart)    local threat, closest = nil, math.huge
     return threat
 end
 
+-- Blink planner: decides walk-vs-blink for an escape step and files it as a
+-- movement command. Returns true when an emergency teleport was requested
+-- (Move.execute performs it); the walk goal is then covered by the caller's
+-- evade request. Never moves directly — arbitration owns all motion.
 local function dodgeAlongEscape(humanoid, rootPart, goal, target, threat, now, forceBlink)
-    if not threat then return end
+    if not threat then return false end
     local delta = goal - rootPart.Position
-    if delta.Magnitude < 0.5 then return end
+    if delta.Magnitude < 0.5 then return false end
     local step = rootPart.Position + delta.Unit * math.min(CFG.DODGE_LATERAL_DISTANCE, delta.Magnitude)
-    if enemyClearance(step) <= enemyClearance(rootPart.Position) and typeof(threat) == "Instance" and threat:IsA("Model") then return end
+    if enemyClearance(step) <= enemyClearance(rootPart.Position) and typeof(threat) == "Instance" and threat:IsA("Model") then return false end
     -- Teleport budget is reserved for telegraphed attacks (zone parts and
     -- announcements). Melee separation walks: spending the 3-per-3s budget
     -- dodging bodies leaves nothing for the one-shot windup that follows.
@@ -1864,8 +2856,10 @@ local function dodgeAlongEscape(humanoid, rootPart, goal, target, threat, now, f
     -- walking is smoother on foot; the blink is for real distance.
     -- Emergencies (least-bad) and intentional bursts (windup) always blink.
     if telegraphed and CFG.TELEPORT_DODGE and (forceBlink or delta.Magnitude > 12) then
-        performDodgeTeleport(humanoid, rootPart, step, target, threat, now)
+        return Move.request("evade", step, "emergency",
+            { source = "blink", threat = threat, teleport = true, walkGoal = goal, ttl = 0.8 })
     end
+    return false
 end
 
 -- Protector separation goes sideways, never backward. Radial escapes back
@@ -1934,6 +2928,12 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
     end
     local risk, zone = ThreatGeometry.risk(state.activeZones, rootPart.Position, CFG.HAZARD_MARGIN)
     state.lastThreatPart = zone and zone.id
+    -- Ownership: dodging preempts navigation but preserves the route.
+    -- saveNavGoal runs once on entry; restore happens when risk clears.
+    local function claimDodge()
+        if state.moveOwner ~= "EMERGENCY_DODGE" then saveNavGoal() end
+        setMoveOwner("EMERGENCY_DODGE")
+    end
     -- Jump-over: thin homing rectangles are cleared by leaving the ground as
     -- they pass under. Only when the zone top is within jump apex (~6 studs)
     -- so tall smash volumes never trigger it.
@@ -1964,11 +2964,39 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
     local crowd = crowdDistance(rootPart.Position)
     local crowdLimit = math.clamp(CFG.COMBAT_MIN_DISTANCE, 6, 22)
     local clearance = enemyClearance(rootPart.Position)
-    local isProt = target.Name == "Ancient Temple Protector"
+    local isProt = target.Name == "Ancient Temple Protector" or smashZonesActive()
+    local isFast = CFG.FAST_CARRY and not CFG.NORTHERN_COMBAT
+    -- FAST CARRY threat gating: the carrier one-shots everything on these
+    -- maps, so telegraphs that have not touched the character are not worth
+    -- leaving DPS position for. Escape only when INSIDE danger (min
+    -- clearance < -1) or in melee contact; otherwise hold and burn. Full
+    -- reactive dodging stays on for Northern Lands.
+    if isFast then
+        local minClearance = math.huge
+        for _, activeZone in ipairs(state.activeZones) do
+            minClearance = math.min(minClearance,
+                ThreatGeometry.clearance(activeZone, rootPart.Position, CFG.HAZARD_MARGIN))
+        end
+        state.fastHold = risk > 0 and minClearance >= -1
+            and not contactThreat and clearance >= 0
+        if state.fastHold then
+            if state.moveOwner == "EMERGENCY_DODGE" then
+                restoreNavGoal()
+                setMoveOwner("idle")
+            end
+            state.escapeGoal = nil
+            return false
+        end
+    else
+        state.fastHold = false
+    end
     -- No crowd-retreats against the Protector: backing off for spacing is
     -- what walks the fight backward into the pit and strands it at range.
     -- Zones and real contact still dodge; spacing alone never retreats.
-    if clearance < 0 and not isProt then state.retreating = true
+    -- FAST CARRY extends this: spacing alone never retreats anywhere.
+    -- One-shot trash dies before spacing matters; retreating only wastes
+    -- clear time. Contact breaks and telegraphs still dodge.
+    if clearance < 0 and not isProt and not isFast then state.retreating = true
     elseif clearance >= CFG.RETREAT_RELEASE_MARGIN then state.retreating = false end
     local contactThreat = meleeThreat(rootPart)
     local contactDistance = (targetRoot.Position - rootPart.Position).Magnitude
@@ -1981,6 +3009,7 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
         end
         state.retreating = true
         if separation then
+            claimDodge()
             clearPath()
             state.escapeGoal, state.escapeUntil = separation, now + 1.25
             state.escapeMargin = CFG.HAZARD_MARGIN
@@ -1989,22 +3018,33 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
             state.escapeReason = "Breaking melee contact"
             state.status = state.escapeReason
             dodgeAlongEscape(humanoid, rootPart, separation, target, contactThreat, now)
-            issueMove(humanoid, separation, "evade", now)
+            Move.request("evade", separation, "evade", { source = "separation" })
             return true
         end
         -- A blocked backward step still permits a lateral escape search.
     end
-    -- Smash response (Protector only): the slam is a full-arena expanding
-    -- rectangle wall. Backing away corners you against the arena edge, so
-    -- this does the opposite: phase 1 closes distance toward the boss while
-    -- the rectangles are small, phase 2 strafes the side with more open
-    -- space. Regular attacks keep the normal backward dodge below; only
-    -- Smash behaves this way (attack-dependent dodge direction).
-    if target.Name == "Ancient Temple Protector" then
-        if protectorWindup(target, targetRoot, rootPart, now) then
-            state.smashStrafeUntil = now + 2.2
-            logThreat("windup", "smash")
-        end
+    -- Smash response (any boss): expanding-rectangle slam walls are answered
+    -- by closing distance while they are small, then strafing the open side.
+    -- Triggered by geometry (ProtectorSmash zones) or the generic windup
+    -- tell, never by boss name. Regular attacks keep the normal escape below.
+    -- Windup detection runs for any boss, but throttled on fast maps: no
+    -- zones, no big boss, no watch. (Animator track polling every tick is
+    -- wasted on one-shot trash.)
+    -- Smash tells are only meaningful for smash-capable bosses: the Protector
+    -- by name, or any boss with live ProtectorSmash geometry on the field.
+    -- Boss HP alone does NOT qualify (high-HP trash would strafe forever),
+    -- and facing-snap alone is meaningless (every melee mob faces you).
+    local smashCapable = target.Name == "Ancient Temple Protector" or smashZonesActive()
+    local windup = false
+    if smashCapable and (not isFast or #state.activeZones > 0) then
+        windup = protectorWindup(target, targetRoot, rootPart, now)
+    end
+    if windup then
+        state.smashStrafeUntil = now + 2.2
+        logThreat("windup", "smash")
+    end
+    if target.Name == "Ancient Temple Protector" or smashZonesActive()
+        or (smashCapable and state.smashStrafeUntil and now < state.smashStrafeUntil) then
         if state.smashStrafeUntil and now < state.smashStrafeUntil then
             local away = Vector3.new(rootPart.Position.X - targetRoot.Position.X, 0, rootPart.Position.Z - targetRoot.Position.Z)
             local dist = away.Magnitude
@@ -2035,6 +3075,7 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
             goal = groundPosition(goal, rootPart.Parent, target)
             if walkingSegmentClear(rootPart, goal, target)
                 and safeEnemyStep(rootPart.Position, goal) then
+                claimDodge()
                 clearPath()
                 state.escapeGoal, state.escapeUntil = goal, now + 0.5
                 state.escapeMargin = CFG.HAZARD_MARGIN
@@ -2042,7 +3083,7 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
                 state.escapeReason = dist > 20 and "Closing on smash windup" or "Strafing smash by open space"
                 state.status = state.escapeReason
                 dodgeAlongEscape(humanoid, rootPart, goal, target, "smash" .. math.floor(now * 10), now, true)
-                issueMove(humanoid, goal, "evade", now)
+                Move.request("evade", goal, "evade", { source = "smash-response" })
                 return true
             end
             -- No valid smash goal: fall through to the regular escape logic.
@@ -2055,6 +3096,20 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
     if risk == 0 and not state.retreating and not contactThreat and crowd >= crowdLimit
         and not state.movementBlocked and not state.blockedByHazard then
         state.escapeGoal, state.threatReactionAt = nil, nil
+        if state.moveOwner == "EMERGENCY_DODGE" then
+            -- Danger passed: restore the preserved navigation objective
+            -- instead of leaving the route erased.
+            -- Evasion credit: an escape followed by 5s with no new damage
+            -- counts as a successful evasion for accuracy tracking.
+            if state.lastEscapeAt and now - state.lastEscapeAt >= 1 then
+                local lastDmg = state.lastDamage and state.lastDamage.at or -math.huge
+                if now - lastDmg > 5 then
+                    state.attackStats.evasions = state.attackStats.evasions + 1
+                end
+            end
+            restoreNavGoal()
+            setMoveOwner("idle")
+        end
         return false
     end
     if state.escapeGoal and now < (state.escapeUntil or 0) then
@@ -2082,8 +3137,10 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
                 state.escapeGoal = nil
             else
             state.status = state.escapeReason or "Avoiding nearby enemies"
+            claimDodge()
             dodgeAlongEscape(humanoid, rootPart, state.escapeGoal, target, zone and zone.id or contactThreat, now)
-            issueMove(humanoid, state.escapeGoal, "evade", now, contMargin < CFG.HAZARD_MARGIN)
+            Move.request("evade", state.escapeGoal, "evade",
+                { source = "escape-carry", bypass = contMargin < CFG.HAZARD_MARGIN })
             return true
             end
         end
@@ -2093,10 +3150,11 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
         state.threatReactionAt = state.threatReactionAt or now
         if now - state.threatReactionAt < CFG.REACTION_TIME then
             state.status = "Reacting to attack"
+            claimDodge()
             return true
         end
     end
-    if now - state.lastEscapePlan < 0.12 then return true end
+    if now - state.lastEscapePlan < 0.12 then claimDodge(); return true end
     state.lastEscapePlan = now
     local goal, escapeMargin, escapeReason = findEscapeGoal(rootPart, targetRoot)
     if not goal and (risk > 0 or state.blockedByHazard) then
@@ -2108,6 +3166,7 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
         if risk > 0 then
             local backup = findLeastBadStep(rootPart, target)
             if backup then
+                claimDodge()
                 clearPath()
                 state.escapeGoal, state.escapeUntil = backup, now + 0.8
                 state.escapeCommitUntil = now + 0.35
@@ -2118,14 +3177,17 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
                 state.status = state.escapeReason
                 logThreat("escape", state.escapeReason)
                 dodgeAlongEscape(humanoid, rootPart, backup, target, zone and zone.id or contactThreat, now, true)
-                issueMove(humanoid, backup, "evade", now, true)
+                Move.request("evade", backup, "evade", { source = "least-bad", bypass = true })
                 return true
             end
         end
         state.status = "Waiting for safe escape route"
+        claimDodge()
         stopMovement(humanoid, rootPart)
         return true
     end
+    claimDodge()
+    saveNavGoal()
     clearPath()
     state.motionGoal, state.fallbackGoal = nil, nil
     state.escapeGoal, state.escapeUntil = goal, now + 1.5
@@ -2139,7 +3201,8 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
     state.escapeReason = escapeReason or (zone and "Escaping attack area" or "Avoiding nearby enemies")
     state.status = state.escapeReason
     logThreat("escape", state.escapeReason)
-    issueMove(humanoid, goal, "evade", now)
+    state.lastEscapeAt = now
+    Move.request("evade", goal, "evade", { source = "escape" })
     return true
 end
 
@@ -2154,6 +3217,118 @@ local function controllerTick()
     end
 
     local now = os.clock()
+    -- Carry profiles drive REAL movement/combat decisions (not just flags):
+    -- FAST_CARRY minimizes dwell time (fast replan, direct walk, no orbit
+    -- dwell, contact-only retreats). NORTHERN_COMBAT keeps survival orbit,
+    -- wider margins, and strafing.
+    if CFG.FAST_CARRY and not CFG.NORTHERN_COMBAT then
+        CFG.PATH_UPDATE_INTERVAL = 0.5
+        CFG.DIRECT_PATH_DISTANCE = 50
+        CFG.STUCK_TIMEOUT = 0.6
+    else
+        CFG.PATH_UPDATE_INTERVAL = 0.8
+        CFG.DIRECT_PATH_DISTANCE = 40
+        CFG.STUCK_TIMEOUT = 0.75
+    end
+    pcall(function()
+        getgenv().DQNavError = nil
+        local charPos = rootPart.Position
+        local tgt = state.currentTarget
+        local tgtRoot = tgt and getRootPart(tgt)
+        local anchor = state.routeAnchors[state.routeAnchorIndex]
+        local waypoint = state.waypoints and state.waypoints[state.currentWaypointIndex]
+        local attackPatterns, trustedPatterns = 0, 0
+        local attackSummary = nil
+        pcall(function()
+            for _, entry in pairs(state.attackMemory) do
+                attackPatterns = attackPatterns + 1
+                if entry.trusted then trustedPatterns = trustedPatterns + 1 end
+            end
+            -- Per-pattern test hook: predicted vs observed, damage, evasions.
+            -- Compare predictedSize/warnAvg against live zones before clears.
+            local boss = state.currentTarget and state.currentTarget.Name or "?"
+            local parts = {}
+            for key, entry in pairs(state.attackMemory) do
+                if #parts < 6 and key:sub(1, #boss) == boss then
+                    table.insert(parts, string.format("%s:s%d/w%.2f/sz%.0f/%s/h%d",
+                        key:sub(#boss + 2), entry.samples or 0, entry.warnAvg or 0,
+                        entry.sizeAvg or 0, entry.targeting or "?", entry.hits or 0))
+                end
+            end
+            if #parts > 0 then attackSummary = table.concat(parts, ";") end
+        end)
+        getgenv().DQNav = {
+            status = state.status, path = state.pathStatus, mode = state.motionMode,
+            owner = state.moveOwner, phase = state.navigationPhase, target = state.targetName,
+            dist = state.targetDist and math.floor(state.targetDist * 10) / 10 or nil,
+            waypoints = state.waypoints and #state.waypoints or 0, wpIndex = state.currentWaypointIndex,
+            waypointPos = waypoint and string.format("%d,%d,%d",
+                math.floor(waypoint.Position.X), math.floor(waypoint.Position.Y), math.floor(waypoint.Position.Z)) or nil,
+            routeFails = state.routeFails or 0, stuck = state.stuckCount or 0,
+            kills = state.kills or 0, running = state.running,
+            dungeon = dungeonName(),
+            charPos = string.format("%d,%d,%d", math.floor(charPos.X), math.floor(charPos.Y), math.floor(charPos.Z)),
+            targetPos = tgtRoot and string.format("%d,%d,%d",
+                math.floor(tgtRoot.Position.X), math.floor(tgtRoot.Position.Y), math.floor(tgtRoot.Position.Z)) or nil,
+            lockedVisible = state.lockedVisible,
+            reachable = state.reachableCount, blockedTargets = state.blockedCount,
+            navGoal = state.motionGoal and string.format("%d,%d,%d",
+                math.floor(state.motionGoal.X), math.floor(state.motionGoal.Y), math.floor(state.motionGoal.Z)) or nil,
+            checkpoint = anchor and anchor.name or nil,
+            lastRoom = state.roomHistory[#state.roomHistory] and state.roomHistory[#state.roomHistory].room or nil,
+            anchorIndex = state.routeAnchorIndex, anchorTotal = #state.routeAnchors,
+            pathComputations = state.pathComputations, pathFails = state.pathFailCount or 0,
+            firstFailedSegment = state.firstFailedSegment,
+            lastFailedSegment = state.lastFailedSegment,
+            bestDist = state.navBestDist ~= math.huge and math.floor(state.navBestDist * 10) / 10 or nil,
+            sinceProgress = state.lastVerifiedProgressAt > 0 and math.floor((now - state.lastVerifiedProgressAt) * 10) / 10 or nil,
+            transitions = state.navTransitions or 0,
+            profile = CFG.NORTHERN_COMBAT and "northern" or "fast",
+            attackPatterns = attackPatterns, trustedPatterns = trustedPatterns,
+            attackSummary = attackSummary,
+            evasions = state.attackStats.evasions, attackHits = state.attackStats.hits,
+            streak = state.fallbackStreak or 0, doorHold = state.doorHold,
+            hotCells = (function() local n = 0 for _ in pairs(state.cellCost) do n = n + 1 end return n end)(),
+            skips = state.routeSkips or 0,
+            recov = state.telemetry and state.telemetry.recoveries or 0,
+            stuckEv = state.telemetry and state.telemetry.stuckEvents or 0,
+            dodges = state.telemetry and state.telemetry.dodges or 0,
+            deaths = state.telemetry and state.telemetry.deaths or 0,
+            noProg = state.telemetry and math.floor(state.telemetry.noProgressSec * 10) / 10 or 0,
+            fastHold = state.fastHold,
+            routeHist = (function()
+                local e = routeMapEntry(false)
+                if not e then return nil end
+                return string.format("runs%d/comp%d/best%d", e.runs or 0, e.completions or 0, e.bestTimeSec or 0)
+            end)(),
+            move = (function()
+                local c = state.moveCmd
+                if not c then return tostring(state.moveReason) end
+                return string.format("%s:%s>%.0f,%.0f,%.0f age%.1f rp%d mt%d tn%d %s",
+                    c.kind, c.source, c.goal.X, c.goal.Y, c.goal.Z,
+                    now - c.at, state.moveReplans or 0, state.moveToCount or 0,
+                    state.moveTurns or 0, tostring(state.moveReason))
+            end)(),
+        }
+        -- Full pattern DB for controlled per-pattern tests (read-only).
+        pcall(function()
+            getgenv().DQAttackMemory = {
+                patterns = state.attackMemory,
+                stats = state.attackStats,
+            }
+        end)
+    end)
+    local navOk, navErr = pcall(function() return getgenv().DQNav ~= nil end)
+    if not navOk or getgenv().DQNav == nil then
+        -- Surface the swallowed error: re-run the two new IIFEs verbosely.
+        local _, e1 = pcall(function()
+            local n = 0
+            for _ in pairs(state.cellCost) do n = n + 1 end
+            return n
+        end)
+        local _, e2 = pcall(function() return routeMapEntry(false) end)
+        getgenv().DQNavError = tostring(e1) .. " // " .. tostring(e2)
+    end
     CFG.ATTACK_RANGE = CFG.SPELL_RANGE_OVERRIDE > 0 and CFG.SPELL_RANGE_OVERRIDE or 26
     if CFG.SMART_FARM then
         local snapshots = abilities.Snapshot(now)
@@ -2198,16 +3373,26 @@ local function controllerTick()
         return
     end
 
-    -- Burn phase: while the Protector lives, it is the only target. Chasing
-    -- adds walks the bot across resolving volleys for no damage gain.
-    if target.Name ~= "Ancient Temple Protector" then
+    -- Burn phase: while a boss-grade enemy (highest MaxHealth on the field)
+    -- lives, it is the only target. Chasing adds walks the bot across
+    -- resolving volleys for no damage gain. Boss-graded by health, not name.
+    do
+        local bestBoss, bestMaxHp = nil, 1e9
         for _, model in ipairs(state.cachedTargets) do
-            if model.Name == "Ancient Temple Protector" and isValidTarget(model) and model:IsDescendantOf(Workspace) then
-                target = model
-                state.lockedTarget = model
-                local bossRoot = getRootPart(model)
+            if model ~= target and isValidTarget(model) and model:IsDescendantOf(Workspace) then
+                local hum = model:FindFirstChildOfClass("Humanoid")
+                if hum and hum.MaxHealth >= bestMaxHp then
+                    bestBoss, bestMaxHp = model, hum.MaxHealth
+                end
+            end
+        end
+        if bestBoss then
+            local currentMaxHp = targetHumanoid and targetHumanoid.MaxHealth or 0
+            if currentMaxHp < bestMaxHp then
+                target = bestBoss
+                state.lockedTarget = bestBoss
+                local bossRoot = getRootPart(bestBoss)
                 if bossRoot then distance = (bossRoot.Position - rootPart.Position).Magnitude end
-                break
             end
         end
     end
@@ -2224,7 +3409,12 @@ local function controllerTick()
             state.motionGoal, state.fallbackGoal = nil, nil
             state.pathUpdateTime = 0
         end
-        state.lastProgressDistance, state.stuckStartTime = math.huge, 0
+        state.lastProgressDistance = math.huge
+        -- NOTE: stuckStartTime is deliberately NOT reset here. Target lock
+        -- flaps between far blocked objectives; resetting the stuck timer on
+        -- every switch meant recovery could never mature (measured: 104s no
+        -- progress, 0 recoveries). Real distance improvement still resets it
+        -- in updateProgress.
         state.routeFails, state.wanderGoal, state.wallSide = 0, nil, nil
         state.wallVisits, state.wallFlips = {}, 0
     end
@@ -2269,6 +3459,7 @@ local function controllerTick()
         end
         faceEnemy(humanoid, rootPart, targetRoot)
         if distance <= CFG.ATTACK_RANGE and not hasBlockingRay(rootPart.Position, targetRoot.Position, character, target) then castSkill() end
+        Move.execute(humanoid, rootPart, target, now)
         return
     end
 
@@ -2283,6 +3474,7 @@ local function controllerTick()
             state.status = "Following map route: " .. routeAnchor.name
             followGoal(humanoid, rootPart, routeGoal, "map-route", now, target)
             updateProgress(humanoid, rootPart, routeGoal, target, now)
+            Move.execute(humanoid, rootPart, target, now)
             return
         end
         -- Target on a higher level: the flat navmesh route walks underneath
@@ -2313,6 +3505,7 @@ local function controllerTick()
                 state.pathStatus = "Climbing to " .. target.Name
                 state.status = state.pathStatus
                 updateProgress(humanoid, rootPart, higher, target, now)
+                Move.execute(humanoid, rootPart, target, now)
                 return
             end
         end
@@ -2394,18 +3587,17 @@ local function controllerTick()
                 state.wanderUntil = now + 6
             end
             state.status = "Holding for wave/door: " .. target.Name
-            if state.wanderGoal then issueMove(humanoid, state.wanderGoal, "hold", now) end
+            if state.wanderGoal then Move.request("hold", state.wanderGoal, "nav", { source = "wander" }) end
             if distance <= CFG.ATTACK_RANGE then castSkill() end
+            Move.execute(humanoid, rootPart, target, now)
             return
-        elseif distance <= 50 and (state.routeFails or 0) < 40 then
-            state.routeFails = 0
-            state.wanderGoal = nil
         end
         state.status = "Routing around obstacle to " .. target.Name
         local approachGoal = protectorApproach or (protectorRear
             and groundPosition(targetRoot.Position - targetRoot.CFrame.LookVector * 16, character, target)) or targetRoot.Position
         followGoal(humanoid, rootPart, approachGoal, "approach", now, target)
         updateProgress(humanoid, rootPart, approachGoal, target, now)
+        Move.execute(humanoid, rootPart, target, now)
         return
     end
     state.navigationPhase = "combat"
@@ -2416,21 +3608,36 @@ local function controllerTick()
         followGoal(humanoid, rootPart, protectorApproach, "approach", now, target)
         updateProgress(humanoid, rootPart, protectorApproach, target, now)
         if distance <= CFG.ATTACK_RANGE then castSkill() end
+        Move.execute(humanoid, rootPart, target, now)
         return
     end
     if not protectorRear and CFG.FARM_POSITION == "Nearest" and distance >= CFG.COMBAT_MIN_DISTANCE and distance <= CFG.COMBAT_MAX_DISTANCE then
         state.status = "Attacking " .. target.Name
-        -- Keep a small combat orbit while casting so a target in range does not
-        -- turn the character into a stationary hitbox.
+        setMoveOwner("COMBAT_MOVEMENT")
+        if CFG.FAST_CARRY and not CFG.NORTHERN_COMBAT then
+            -- FAST CARRY: one-shot profile. Hold still and burn: no orbit
+            -- dwell, no retreat, attack the instant the enemy is in range and
+            -- advance the instant it dies (target switch handles that).
+            -- Emergency dodges still preempt via handleSafety above.
+            stopMovement(humanoid, rootPart)
+            castSkill()
+            Move.execute(humanoid, rootPart, target, now)
+            return
+        end
+        -- NORTHERN COMBAT: keep a small orbit while casting so a target in
+        -- range does not turn the character into a stationary hitbox.
+        -- Strafing stays smooth: fixed dodgeSide, no per-tick flips.
         local offset = rootPart.Position - targetRoot.Position
         local flat = Vector3.new(offset.X, 0, offset.Z)
         if flat.Magnitude < 0.1 then flat = Vector3.new(1, 0, 0) end
         local tangent = Vector3.new(-flat.Z, 0, flat.X).Unit * state.dodgeSide * 4
         local desiredPosition = groundPosition(targetRoot.Position + flat.Unit * CFG.COMBAT_DISTANCE + tangent, character, target)
+        desiredPosition = steerAroundWall(rootPart, desiredPosition, target)
         if (desiredPosition - rootPart.Position).Magnitude > 1 then
             followGoal(humanoid, rootPart, desiredPosition, "combat", now, target)
         end
         castSkill()
+        Move.execute(humanoid, rootPart, target, now)
         return
     end
 
@@ -2451,6 +3658,7 @@ local function controllerTick()
         end
     end
     local desiredPosition = groundPosition(targetRoot.Position + flat.Unit * CFG.COMBAT_DISTANCE, character, target)
+    desiredPosition = steerAroundWall(rootPart, desiredPosition, target)
     -- Idle creep (Protector): with no active threats, blink small steps
     -- toward the hold instead of only walking. Closes distance between
     -- volleys so the fight happens at sidestep range, not cross-arena.
@@ -2462,13 +3670,15 @@ local function controllerTick()
             if safeEnemyStep(rootPart.Position, step)
                 and ThreatGeometry.segmentSafe(state.activeZones, rootPart.Position, step, CFG.HAZARD_MARGIN)
                 and walkingSegmentClear(rootPart, step, target) then
-                performDodgeTeleport(humanoid, rootPart, step, target, "creep", now)
+                Move.request("combat", step, "emergency",
+                    { source = "creep", threat = "creep", teleport = true, walkGoal = desiredPosition, ttl = 0.8 })
             end
         end
     end
     if (Vector3.new(desiredPosition.X - rootPart.Position.X, 0, desiredPosition.Z - rootPart.Position.Z)).Magnitude < 2 then
         stopMovement(humanoid, rootPart)
         if distance <= CFG.ATTACK_RANGE then castSkill() end
+        Move.execute(humanoid, rootPart, target, now)
         return
     end
     state.status = protectorRear and "Circling Protector in spell range"
@@ -2476,6 +3686,7 @@ local function controllerTick()
     followGoal(humanoid, rootPart, desiredPosition, "combat", now, target)
     updateProgress(humanoid, rootPart, desiredPosition, target, now)
     if distance <= CFG.ATTACK_RANGE then castSkill() end
+    Move.execute(humanoid, rootPart, target, now)
 end
 
 connect(RunService.RenderStepped, function()
@@ -2504,7 +3715,7 @@ connect(RunService.Heartbeat, function()
     state.updateBusy = false
     if not ok and now - lastError >= 2 then
         lastError = now
-        warn("[EnemyWalker] controller error: " .. tostring(err))
+        warn("[EnemyWalker] controller error: " .. tostring(err) .. "\n" .. tostring(debug.traceback()))
     end
 end)
 
@@ -2529,6 +3740,16 @@ local function setRunning(running)
         state.wallSide, state.wallVisits, state.wallFlips = nil, {}, 0
         state.routeDungeon, state.routeAnchors, state.routeAnchorIndex = nil, {}, 1
         state.routeScannedAt = -math.huge
+        state.blockedSegments, state.anchorFails = {}, {}
+        state.cellCost, state.fallbackStreak, state.doorHold = {}, 0, nil
+        state.roomHistory, state.navSamples, state.navLoopCount = {}, {}, 0
+        state.moveOwner, state.savedNavGoal, state.savedNavMode = "idle", nil, nil
+        state.navGoalKey, state.navBestDist, state.navBestAt = nil, math.huge, 0
+        state.lastVerifiedProgressAt, state.navTransitions = os.clock(), 0
+        state.telemetry = { recoveries = 0, stuckEvents = 0, dodges = 0,
+            deaths = 0, noProgressSec = 0, startedAt = os.clock() }
+        state.pathFailCount = 0
+        state.firstFailedSegment, state.lastFailedSegment = nil, nil
         state.doomWatch, state.doomFired = nil, nil
         state.lastDodgeThreat, state.lastDodgeThreatAt = nil, 0
         state.dodgeCount, state.damageEvents, state.lastPlayerHealth = 0, 0, nil
@@ -2569,6 +3790,9 @@ local function watchHealth(character)
     if state.healthConnection then state.healthConnection:Disconnect() end
     local previous = humanoid.Health
     state.healthConnection = connect(humanoid.HealthChanged, function(health)
+        if health <= 0 and previous > 0 and state.telemetry then
+            state.telemetry.deaths = state.telemetry.deaths + 1
+        end
         if state.running and not state.closed and character == player.Character and health < previous - 0.01 then
             state.damageEvents = state.damageEvents + 1
             state.lastDamage = { amount = previous - health, at = os.clock(), health = health,
@@ -2604,6 +3828,38 @@ local function watchHealth(character)
             warn(string.format("[EnemyWalker] damage event #%d (%.0f -> %.0f)", state.damageEvents, previous, health))
             pcall(function() getgenv().DQLastDamage = state.lastDamage end)
             logThreat("hit", { amount = math.floor(previous - health) })
+            -- Prediction scoring: a hit within 3s of an escape is a failed
+            -- evasion; otherwise it is an unpredicted hit. Both feed accuracy
+            -- tracking; only trusted (>=3-sample) patterns drive prediction.
+            -- Attribute the hit to overlapping patterns so per-attack hit
+            -- rates (predicted vs observed) can be compared per pattern.
+            pcall(function()
+                loadAttackMemory()
+                if state.lastEscapeAt and os.clock() - state.lastEscapeAt < 3 then
+                    state.attackStats.hits = state.attackStats.hits + 1
+                else
+                    state.attackStats.hits = state.attackStats.hits + 1
+                end
+                local boss = state.currentTarget and state.currentTarget.Name or "unknown"
+                local attributed = 0
+                if root then
+                    for _, zone in ipairs(state.activeZones) do
+                        if ThreatGeometry.clearance(zone, root.Position, 0) < 0 and attributed < 3 then
+                            local attackId = typeof(zone.id) == "Instance" and zone.id.Name
+                                or tostring(zone.name or zone.shape)
+                            local key = attackKey(boss, attackId)
+                            local entry = state.attackMemory[key]
+                            if entry then
+                                entry.hits = (entry.hits or 0) + 1
+                                entry.lastHitAt = os.clock()
+                                entry.lastHitPos = quantizePos(root.Position)
+                                attributed = attributed + 1
+                            end
+                        end
+                    end
+                end
+                if state.damageEvents % 5 == 0 then saveAttackMemory() end
+            end)
         end
         previous = health
     end)
@@ -2625,6 +3881,11 @@ connect(player.CharacterAdded, function(character)
     state.lastPlayerHealth, state.lastTargetScan = nil, 0
     state.routeDungeon, state.routeAnchors, state.routeAnchorIndex = nil, {}, 1
     state.routeScannedAt = -math.huge
+    state.blockedSegments, state.anchorFails = {}, {}
+    state.cellCost, state.fallbackStreak, state.doorHold = {}, 0, nil
+    state.roomHistory, state.navSamples, state.navLoopCount = {}, {}, 0
+    state.moveOwner, state.savedNavGoal, state.savedNavMode = "idle", nil, nil
+    state.navGoalKey, state.navBestDist = nil, math.huge
     state.pathUpdateTime = 0
     state.stuckStartTime, state.stuckCount = 0, 0
     state.dodgeGoal = nil
@@ -2641,6 +3902,7 @@ return {
     State = state,
     SetRunning = setRunning,
     Shutdown = shutdown,
+    NoteCompletion = function(durationSec) noteCompletion(durationSec) end,
     AbilityStatus = function() return abilities.Snapshot(os.clock()) end,
     SetAbilityInventory = abilities.SetInventory,
     AbilityProfile = FarmPlanner.profile,
