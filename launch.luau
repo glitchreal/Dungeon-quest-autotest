@@ -1,4 +1,5 @@
 getgenv().autoexecute = true
 getgenv().autoloadconfig = true
 
-loadstring(game:HttpGet("https://raw.githubusercontent.com/glitchreal/Dungeon-quest/main/main.luau"))()
+-- Autotest checkout: exercise the autotest mirror bundle.
+loadstring(game:HttpGet("https://raw.githubusercontent.com/glitchreal/Dungeon-quest-autotest/main/main.luau"))()

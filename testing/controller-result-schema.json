@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["status", "buildRevision", "gameplayObserved", "verifiedClear", "firstFailedSegment", "summary"],
+  "properties": {
+    "status": { "type": "string", "enum": ["completed", "blocked", "needs_user", "failed"] },
+    "buildRevision": { "type": ["string", "null"] },
+    "gameplayObserved": { "type": "boolean" },
+    "verifiedClear": { "type": "boolean" },
+    "firstFailedSegment": { "type": ["string", "null"] },
+    "summary": { "type": "string" }
+  }
+}

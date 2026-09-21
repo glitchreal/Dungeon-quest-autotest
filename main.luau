@@ -1,8 +1,10 @@
--- Public entry point: https://github.com/glitchreal/Dungeon-quest
+-- Public entry point (autotest mirror): https://github.com/glitchreal/Dungeon-quest-autotest
+-- Teleport continuation in THIS checkout loads the autotest bundle so tests
+-- exercise the local revision, never a stale upstream copy.
 local env = getgenv()
 if env.autoexecute == nil then env.autoexecute = true end
 if env.autoloadconfig == nil then env.autoloadconfig = true end
-local ROOT = "https://raw.githubusercontent.com/glitchreal/Dungeon-quest/main/"
+local ROOT = "https://raw.githubusercontent.com/glitchreal/Dungeon-quest-autotest/main/"
 local routes = {
     [77649408247578] = "lobby", -- Main lobby
     [115445507767090] = "lobby", -- Level 100+ lobby

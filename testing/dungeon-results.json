@@ -12,21 +12,25 @@
   "dungeons": [
     {
       "access": "unknown",
-      "attempts": 0,
+      "attempts": 2,
       "availability": "visible-in-queue",
       "clears": 0,
       "deaths": 0,
-      "difficulty": "unknown",
+      "difficulty": "Insane",
       "damageTaken": 0,
       "durationSec": 0,
-      "errors": [],
+      "errors": [
+        "Attempt 1: FAST profile first test. Run started 2026-09-20T15:41:40Z",
+        "Attempt 1: ended during pathfinding diagnosis (teleported to lobby); no clear observed, NOT counted as clear. Evidence: 7 pylon targets all behind walls 111-169 studs, 0 kills in 3+ min, ~85-stud drift. PathfindingService + checkpoint routing exist; suspect anchor exhaustion or locked-door hold/wander loop. DQNav hook added for live state.",
+        "Attempt 2 (nav-overhaul + predictive build c14f441+dirty, FAST profile): run started ~2026-09-21T04:22Z after lobby bundle auto-queued Aquatic Temple. +90s probe: 'Following map route: room3', anchors 3/7 with 2 verified transitions, target Defensive Pyramid Pylon @153.9 studs, 0 reachable / 7 blocked, 0 kills, 5 path fails with recorded first-failed-segment. Improvement vs attempt 1 (verified transitions now occur). Run ended ~5 min in, returned to lobby; no clear observed, NOT counted as clear."
+      ],
       "failures": 0,
       "hitlessClears": 0,
       "lastCommit": "",
-      "lastTested": "",
+      "lastTested": "2026-09-21T04:30:40Z",
       "name": "Aquatic Temple",
       "navFailures": 0,
-      "status": "pending"
+      "status": "testing"
     },
     {
       "access": "unknown",
@@ -149,10 +153,10 @@
     },
     {
       "access": "unknown",
-      "attempts": 26,
+      "attempts": 28,
       "availability": "visible-in-queue",
       "clears": 0,
-      "deaths": 82,
+      "deaths": 88,
       "difficulty": "unknown",
       "damageTaken": 432927456,
       "durationSec": 0,
@@ -184,12 +188,14 @@
         "Attempt 23: NO CLEAR. Boss 5Q->3.24Q (~65%) then run ended. 0/23.",
         "Attempt 24: NO CLEAR. Boss 5Q->3.99Q (~80%) then run ended. 0/24.",
         "Attempt 25: NO CLEAR. Boss 5Q->2.97Q (~59%) then run ended. 0/25.",
-        "Attempt 26: NO CLEAR. Boss 5Q->3.06Q (~61%) then run ended. 0/26."
+        "Attempt 26: NO CLEAR. Boss 5Q->3.06Q (~61%) then run ended. 0/26.",
+        "Attempt 27: NO CLEAR (boss 40% then run ended). 0/27. Lobby-driving for Aquatic Temple interrupted by bridge drop; user queued Northern Lands again.",
+        "Attempt 28: NO CLEAR (outOfTime, boss 61%). 0/28. Lobby config switched to Aquatic Temple in fresh-lobby window (in-memory autosave had been clobbering file edits)."
       ],
-      "failures": 26,
+      "failures": 28,
       "hitlessClears": 0,
       "lastCommit": "7d71766",
-      "lastTested": "2026-09-20T11:37:16Z",
+      "lastTested": "2026-09-20T15:41:40Z",
       "name": "Northern Lands",
       "status": "blocked"
     },
