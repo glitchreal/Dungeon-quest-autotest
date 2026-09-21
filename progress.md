@@ -177,6 +177,18 @@
   - Run telemetry in DQNav: `recov`, `stuckEv`, `dodges`, `deaths`, `noProg`, `skips`, `routeHist` (runs/comp/best from memory).
 - Still map-specific by design: Protector flank/rear, aquatic line templates. No neural net; week-scale data does not justify RL — experience-weighted costs + costmap is the honest technique.
 - Limitation (stated, not hidden): no private-server link on file — tests run in auto-queued ReservedServer dungeon instances (private) from the shared lobby; lobby itself is StandardServer.
+
+## Movement architecture audit (2026-09-21 — the "who fights over motion" answer)
+- Physical layer: `issueMove` was ALREADY the only `Humanoid:MoveTo` site; `performDodgeTeleport` the only CFrame writer. The fight was never duplicate issuers — it was decision thrash above them.
+- Proven oscillation source (live metric): evade arrival-consumption caused evade→nav→evade flip-flop (782 replans/2min). Fixed: arrivals consume nav only.
+- Proven dodge spam (live count): 49 blinks/75s vs trash from facing-snap windup on high-HP mobs. Fixed: smash response requires Protector name or live ProtectorSmash geometry.
+- Proven freeze (live errors): Lua use-before-def nil-calls (no hoisting) killed every tick for a full run. Fixed + static checker clean on all modules.
+- Unified arbitration now: planners `Move.request`, one `Move.execute` per tick, priority emergency > evade > nav, hazard gate on nav goals, teleport-denied walk fallback, `DQNav.move` readout (source/goal/age/replans/reason).
+- Honest limits: no access to server navmesh beyond PathfindingService; no attack-timing API beyond telegraph parts/remotes already read; ML/RL unjustified — experience-weighted costs + costmap + memory is the technique, not called AI.
+
+## Attempt 3-5 — Aquatic Temple (ENDED, no clears, 2026-09-21)
+- `testing/dungeon-results.json` (attempts 2→5, failures 3): nil-call freeze + anti-cheat kick observed; arbitration live with zero errors; windup over-trigger measured and fixed. Attack memory 6556B persisting across teleports; route memory empty (mechanism live, awaiting first records).
+- Queue retargeted to Northern Lands (one run authorized under new-code rule: arbitration + smash gating + Stage 2 are substantive changes, not unchanged retries).
 - Phase 10: `main.luau`/`launch.luau`/`src/ObsidianHub.luau`/`build.lua` fallback loader now targets `Dungeon-quest-autotest`; `build.lua` stamps every bundle with `DQBuildRevision` + `DQBuildTime` for per-test revision verification. Public README snippet untouched (still points at original for end users).
 - Phase 8/9: `tools/dq-controller.sh` is now a real supervisor (32 iters, 15-min timeout enforced via killer process, 3-recovery/3-repeat blockers, persisted `testing/controller-state.json`, 480-min campaign cap, free-model-only `opencode run`, results-schema check; agent exit ≠ clear). `tools/dq-watchdog.sh` separates process/connector/MCP/place/session checks; teleports ≠ crashes; `DQ_PRIVATE_LINK` validated, never logged.
 - `AGENTS.md`: fixed stale push-target line to `glitchreal/Dungeon-quest-autotest`.

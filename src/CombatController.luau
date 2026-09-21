@@ -1100,6 +1100,35 @@ local function pathKey(startPosition, endPosition, mode)
     return string.format("%s:%d,%d,%d>%d,%d,%d", mode or "combat", quantize(startPosition.X), quantize(startPosition.Y), quantize(startPosition.Z), quantize(endPosition.X), quantize(endPosition.Y), quantize(endPosition.Z))
 end
 
+-- Drop-edge search (measured cause, Aquatic Temple 2026-09-21): objective
+-- significantly below (dy < -8) across a floor gap, direct blocked,
+-- repeated ComputeAsync failures. The game intends a drop point along the
+-- ledge. Traverse perpendicular to the goal bearing probing for a cell
+-- whose floor is >6 below current footing with a clear walk segment;
+-- commit to the nearest such edge. Returns nil when no drop found.
+local function findDropEdge(rootPart, goal, target, now)
+    local toGoal = goal - rootPart.Position
+    if toGoal.Y > -8 then return nil end
+    local flat = Vector3.new(toGoal.X, 0, toGoal.Z)
+    if flat.Magnitude < 6 then return nil end
+    local bearing = math.atan2(toGoal.Z, toGoal.X)
+    local params = buildRaycastParams(rootPart.Parent, target)
+    params.RespectCanCollide = true
+    for _, side in ipairs({ 1, -1 }) do
+        local tangent = Vector3.new(-math.sin(bearing), 0, math.cos(bearing)) * side
+        for _, radius in ipairs({ 8, 16, 24, 32, 40 }) do
+            local candidate = rootPart.Position + tangent * radius
+            candidate = groundPosition(candidate, rootPart.Parent, target)
+            local below = Workspace:Raycast(candidate + Vector3.new(0, 2, 0), Vector3.new(0, -40, 0), params)
+            if below and below.Position.Y < rootPart.Position.Y - 6
+                and walkingSegmentClear(rootPart, candidate, target) then
+                return candidate
+            end
+        end
+    end
+    return nil
+end
+
 -- Wall-slide steering: when a wall is close ahead but the goal lies beyond
 -- it, deflect ±35° and take the side with the longer clear ray. Returns the
 -- goal unchanged when the way is open or no verified side exists. Applied to
@@ -1278,6 +1307,7 @@ local function issueMove(humanoid, position, mode, now, bypass)
     end
     if changed or now - state.lastMoveToCall >= CFG.MOVETO_REFRESH_INTERVAL then
         humanoid:MoveTo(position)
+        state.moveToCount = (state.moveToCount or 0) + 1
         state.lastMoveToCall = now
         state.lastMoveToPosition = position
         state.lastIssueAt, state.lastIssuePos = now, position
@@ -1567,11 +1597,22 @@ local function followGoal(humanoid, rootPart, goal, mode, now, target)
             state.directProbe = probe
         end
         if probe.clear then
+            state.directUnclearStreak = 0
             if not state.directTravel then clearPath() end
             state.directTravel, state.pathMode = true, mode
             state.pathStatus = "Pathfinding: direct walk"
             Move.request(mode, goal, "nav", { source = "direct" })
             return
+        else
+            -- Hysteresis: one unclear sample (marginal geometry, moving mob)
+            -- must not kill direct travel. Two consecutive unclear probes
+            -- before falling through to pathfinding.
+            state.directUnclearStreak = (state.directUnclearStreak or 0) + 1
+            if state.directUnclearStreak < 2 and state.directTravel then
+                state.pathStatus = "Pathfinding: direct walk"
+                Move.request(mode, goal, "nav", { source = "direct" })
+                return
+            end
         end
     end
     state.directTravel = false
@@ -1705,7 +1746,23 @@ local function followGoal(humanoid, rootPart, goal, mode, now, target)
             and walkingSegmentClear(rootPart, goal, target) then
             Move.request(mode, goal, "nav", { source = "path-exhausted" })
         else
-            if now - (state.lastPendingStep or -math.huge) >= 0.2 then
+            -- Drop signature: objective below across a gap with repeated
+            -- failures — search the ledge for the intended drop point and
+            -- commit (4s TTL) instead of shuffling fallback steps.
+            local dropEdge = nil
+            if goal.Y - rootPart.Position.Y < -8 then
+                local gkey = string.format("%d,%d,%d",
+                    math.floor(goal.X / 4), math.floor(goal.Y / 4), math.floor(goal.Z / 4))
+                local gfails = state.blockedSegments["goal:" .. gkey]
+                if gfails and gfails.fails >= 2 then
+                    dropEdge = findDropEdge(rootPart, goal, target, now)
+                end
+            end
+            if dropEdge then
+                state.fallbackGoal, state.fallbackUntil = dropEdge, now + 4.0
+                state.pathStatus = "Pathfinding: drop edge search"
+                Move.request(mode, dropEdge, "nav", { source = "drop-edge", ttl = 4.0 })
+            elseif now - (state.lastPendingStep or -math.huge) >= 0.2 then
                 state.lastPendingStep = now
                 local fallback = chooseFallbackStep(rootPart, goal, target)
                 if fallback then
@@ -3217,9 +3274,10 @@ local function controllerTick()
             move = (function()
                 local c = state.moveCmd
                 if not c then return tostring(state.moveReason) end
-                return string.format("%s:%s>%.0f,%.0f,%.0f age%.1f rp%d %s",
+                return string.format("%s:%s>%.0f,%.0f,%.0f age%.1f rp%d mt%d %s",
                     c.kind, c.source, c.goal.X, c.goal.Y, c.goal.Z,
-                    now - c.at, state.moveReplans or 0, tostring(state.moveReason))
+                    now - c.at, state.moveReplans or 0, state.moveToCount or 0,
+                    tostring(state.moveReason))
             end)(),
         }
         -- Full pattern DB for controlled per-pattern tests (read-only).
