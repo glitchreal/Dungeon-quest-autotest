@@ -117,6 +117,23 @@ function Geometry.risk(zones, position, margin)
     return risk, nearest and nearest.zone
 end
 
+-- Time (seconds) until the player's point breaches the zone at margin 0.
+-- Moving zones: clearance divided by closing speed along the player vector.
+-- Static zones: infinity (they never arrive; only the player can enter).
+-- Separating zones: infinity. Returns math.huge when no intercept exists.
+-- Lets the dodger distinguish "inside/arriving now" from "exists nearby".
+function Geometry.intercept(zone, position)
+    local clearance = Geometry.clearance(zone, position, 0)
+    if clearance < 0 then return 0 end
+    local velocity = zone.velocity
+    if not velocity or velocity.Magnitude < 0.5 then return math.huge end
+    local toPlayer = position - zone.frame.Position
+    if toPlayer.Magnitude < 0.01 then return 0 end
+    local closing = velocity:Dot(toPlayer.Unit)
+    if closing <= 0.5 then return math.huge end
+    return clearance / closing
+end
+
 function Geometry.segmentSafe(zones, startPosition, endPosition, margin)
     local relevant = {}
     local padding = math.sqrt(2 * margin * margin + 16)
