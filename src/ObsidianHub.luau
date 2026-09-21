@@ -552,6 +552,9 @@ local function finishRun(success)
     controller.SetRunning(false)
     clearHover()
     local duration = runStartedAt and os.clock() - runStartedAt or 0
+    if success and controller.NoteCompletion then
+        pcall(function() controller.NoteCompletion(duration) end)
+    end
     totals.Runs = totals.Runs + 1
     totals[success and "Completed" or "Failed"] = totals[success and "Completed" or "Failed"] + 1
     if success then totals.Duration = totals.Duration + duration end

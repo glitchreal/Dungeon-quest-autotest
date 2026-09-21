@@ -182,6 +182,9 @@ local state = {
     attackMemory = {},
     attackStats = { evasions = 0, hits = 0, falseAlarms = 0 },
     attackMemoryLoaded = false,
+    -- Persistent route memory (per-map geometric experience).
+    routeMemory = {},
+    routeMemoryLoaded = false,
     -- Diagnostics for the DQNav hook.
     pathFailCount = 0,
     firstFailedSegment = nil,
@@ -351,6 +354,90 @@ local function predictedRisk(zones, position, margin)
         if clearance < 0 then risk = risk + 1 + clearance * clearance end
     end
     return risk
+end
+
+-- Forward declaration (lexically BEFORE first use): route memory keys on
+-- the map name, but dungeonName() is defined further down. The assignment
+-- later fills this upvalue.
+local dungeonName
+
+-- Persistent route memory: per-map geometric experience (verified anchor
+-- transitions, anchor edge failures, completions, best time). Keyed by map
+-- name only — geometry does not change with difficulty. Entries expire after
+-- 14 days so reworked maps cannot poison routing forever. Used for exactly
+-- one behavior: historically-dead edges (6+ fails, 0 verified transitions)
+-- are treated as blocked immediately instead of costing 3 fresh strikes.
+-- Everything else still requires live verification every run.
+local ROUTE_MEMORY_FILE = "DungeonQuestObsidian-route-memory.json"
+local ROUTE_MEMORY_TTL = 14 * 24 * 3600
+local function routeMapKey()
+    return dungeonName() or "unknown"
+end
+local function loadRouteMemory()
+    if state.routeMemoryLoaded then return end
+    state.routeMemoryLoaded = true
+    if type(readfile) ~= "function" then return end
+    local ok, data = pcall(function()
+        return game:GetService("HttpService"):JSONDecode(readfile(ROUTE_MEMORY_FILE))
+    end)
+    if ok and type(data) == "table" then
+        state.routeMemory = data.maps or {}
+    end
+end
+local function saveRouteMemory()
+    if type(writefile) ~= "function" then return end
+    pcall(function()
+        writefile(ROUTE_MEMORY_FILE, game:GetService("HttpService"):JSONEncode({
+            maps = state.routeMemory, savedAt = os.time(),
+        }))
+    end)
+end
+local function routeMapEntry(create)
+    loadRouteMemory()
+    state.routeMemory = state.routeMemory or {}
+    local key = routeMapKey()
+    local entry = state.routeMemory[key]
+    if entry and os.time() - (entry.updatedAt or 0) > ROUTE_MEMORY_TTL then
+        state.routeMemory[key] = nil
+        entry = nil
+    end
+    if not entry and create then
+        entry = { transitions = {}, edgeFails = {}, completions = 0, bestTimeSec = 0, runs = 0, updatedAt = os.time() }
+        state.routeMemory[key] = entry
+    end
+    return entry
+end
+local function noteTransition(anchorName)
+    local entry = routeMapEntry(true)
+    if not entry then return end
+    entry.transitions[anchorName or "?"] = (entry.transitions[anchorName or "?"] or 0) + 1
+    entry.updatedAt = os.time()
+    entry._dirty = (entry._dirty or 0) + 1
+    if entry._dirty % 5 == 1 then saveRouteMemory() end
+end
+local function noteEdgeFail(anchorIndex)
+    local entry = routeMapEntry(true)
+    if not entry then return end
+    local key = tostring(anchorIndex)
+    entry.edgeFails[key] = (entry.edgeFails[key] or 0) + 1
+    entry.updatedAt = os.time()
+end
+local function edgeDeadFromHistory(anchorIndex)
+    local entry = routeMapEntry(false)
+    if not entry then return false end
+    return (entry.edgeFails[tostring(anchorIndex)] or 0) >= 6
+end
+local function noteCompletion(durationSec)
+    local entry = routeMapEntry(true)
+    if not entry then return end
+    entry.completions = entry.completions + 1
+    entry.runs = entry.runs + 1
+    if durationSec and durationSec > 0
+        and (entry.bestTimeSec == 0 or durationSec < entry.bestTimeSec) then
+        entry.bestTimeSec = durationSec
+    end
+    entry.updatedAt = os.time()
+    saveRouteMemory()
 end
 
 local abilities = AbilityController.new(player, function(slot)
@@ -584,7 +671,7 @@ local function getRootPart(model)
     return model.PrimaryPart
 end
 
-local function dungeonName()
+dungeonName = function()
     local value = Workspace:FindFirstChild("dungeonName")
     return value and value:IsA("ValueBase") and tostring(value.Value) or nil
 end
@@ -633,6 +720,13 @@ local function recordSegmentFail(key, now, opts)
     state.lastFailedSegment = key
     local entry = state.blockedSegments[key] or { fails = 0, blockedUntil = 0 }
     entry.fails = entry.fails + 1
+    -- History seeding: a historically-dead anchor edge starts with 2
+    -- pre-existing strikes, so ONE fresh failure blocks it instead of three.
+    -- Live verification still required every run; history only accelerates.
+    if entry.fails == 1 and key:sub(1, 7) == "anchor:" then
+        local idx = tonumber(key:match("anchor:(%d+)"))
+        if idx and edgeDeadFromHistory(idx) then entry.fails = 3 end
+    end
     -- Learned costmap: a failed segment teaches the local explorer to avoid
     -- the ground around both endpoints. Cost 10 per failure, capped at 30,
     -- decaying after 60s (swept in updateProgress).
@@ -659,6 +753,10 @@ end
 
 -- First static blocker name on a segment (doors/gates vs plain walls).
 -- Returns nil when the segment is clear or only dynamic bodies block it.
+-- Forward declaration (lexically BEFORE first use): blockingPartName probes
+-- segments with buildRaycastParams, defined further down with hasBlockingRay.
+local buildRaycastParams
+
 local function blockingPartName(origin, destination, character, target)
     local direction = destination - origin
     local params = buildRaycastParams(character, target)
@@ -712,10 +810,52 @@ local function mapRouteGoal(rootPart, now)
             if not anchor then return nil end
         end
         local key = tostring(state.routeAnchorIndex)
+        -- Arrival catch-up: reaching a LATER checkpoint proves the earlier
+        -- rooms were traversed (linear dungeons route through them), so
+        -- collect every anchor up to the furthest verified one. Position
+        -- verified, never assumed.
+        for lookahead = 1, 2 do
+            local future = state.routeAnchors[state.routeAnchorIndex + lookahead]
+            if not future or not future.part.Parent then break end
+            local fdelta = rootPart.Position - future.part.Position
+            local fflat = Vector3.new(fdelta.X, 0, fdelta.Z).Magnitude
+            if fflat <= CFG.ANCHOR_REACH_FLAT and math.abs(fdelta.Y) <= CFG.ANCHOR_REACH_VERTICAL
+                and not hasBlockingRay(rootPart.Position, future.part.Position, rootPart.Parent, nil) then
+                for _ = 1, lookahead + 1 do
+                    local done = state.routeAnchors[state.routeAnchorIndex]
+                    state.routeAnchorIndex = state.routeAnchorIndex + 1
+                    state.navTransitions = (state.navTransitions or 0) + 1
+                    if done then
+                        table.insert(state.roomHistory, { at = now, room = done.name or "" })
+                        noteTransition(done.name or "")
+                    end
+                end
+                while #state.roomHistory > 40 do table.remove(state.roomHistory, 1) end
+                break
+            end
+        end
+        anchor = state.routeAnchors[state.routeAnchorIndex]
+        if not anchor then return nil end
+        key = tostring(state.routeAnchorIndex)
         if segmentBlocked("anchor:" .. key, now) then
             -- A blocked edge is NOT a completed checkpoint. Retain this
             -- anchor until verified arrival; local path retries are bounded
             -- separately. Skipping here loses required rooms permanently.
+            -- Skip-AHEAD (not skip-over): when the immediate edge is blocked,
+            -- probe up to 2 anchors forward for an unblocked edge and route
+            -- there instead of ramming the blocked one. The blocked anchor
+            -- stays un-advanced, so its room is still required later: when
+            -- its cooldown expires the tight reach check collects it on the
+            -- way back through. No required room is ever marked complete
+            -- without verified arrival.
+            for lookahead = 1, 2 do
+                local future = state.routeAnchors[state.routeAnchorIndex + lookahead]
+                if not future then break end
+                if not segmentBlocked("anchor:" .. tostring(state.routeAnchorIndex + lookahead), now) then
+                    state.routeSkips = (state.routeSkips or 0) + 1
+                    return future.part.Position + Vector3.new(0, 2.5, 0), future
+                end
+            end
             return anchor.part.Position + Vector3.new(0, 2.5, 0), anchor
         else
             local delta = rootPart.Position - anchor.part.Position
@@ -730,6 +870,7 @@ local function mapRouteGoal(rootPart, now)
                     local room = anchor.name or ""
                     table.insert(state.roomHistory, { at = now, room = room })
                     while #state.roomHistory > 40 do table.remove(state.roomHistory, 1) end
+                    noteTransition(room)
                 else
                     return anchor.part.Position + Vector3.new(0, 2.5, 0), anchor
                 end
@@ -851,7 +992,7 @@ local function getClosestEnemy(rootPart, now)
     return state.lockedTarget, pickDist
 end
 
-local function buildRaycastParams(character, target)
+buildRaycastParams = function(character, target)
     local ignored = { character }
     if target then table.insert(ignored, target) end
     if state.waypointFolder then table.insert(ignored, state.waypointFolder) end
@@ -1062,12 +1203,127 @@ local function issueMove(humanoid, position, mode, now, bypass)
         end
     end
     local changed = state.motionMode ~= mode or (position - state.lastMoveToPosition).Magnitude > 0.75
+    -- Commit guard (anti-jitter): navigation goals re-derive every tick, so
+    -- re-issuing MoveTo for sub-stud wobble fights the humanoid controller.
+    -- Hold the last command 0.3s unless the goal jumped >5 studs. Escapes and
+    -- dodges bypass: they already carry their own commit timing.
+    if not bypass and mode ~= "evade" then
+        local sinceIssue = now - (state.lastIssueAt or -math.huge)
+        local goalJump = (position - (state.lastIssuePos or position)).Magnitude
+        if sinceIssue < 0.3 and goalJump < 5 then
+            state.motionMode = mode
+            return
+        end
+    end
     if changed or now - state.lastMoveToCall >= CFG.MOVETO_REFRESH_INTERVAL then
         humanoid:MoveTo(position)
         state.lastMoveToCall = now
         state.lastMoveToPosition = position
+        state.lastIssueAt, state.lastIssuePos = now, position
     end
     state.motionMode = mode
+end
+
+-- Forward declaration: Move.execute consumes emergency teleports, whose
+-- implementation lives with the dodge planners below.
+local performDodgeTeleport
+
+-- Unified movement arbitration: exactly ONE command slot. Navigation,
+-- combat, dodge, and recovery PRODUCE commands via Move.request; only
+-- Move.execute consumes them (single Humanoid:MoveTo site per tick, plus
+-- the emergency teleport path). Priority: emergency (dodge teleports) >
+-- evade (active escapes) > nav (route/approach/combat/recovery/hold).
+-- Equal priority: freshest wins. Lower priority never preempts.
+-- Every decision is inspectable: DQNav.move = source/goal/age/replans/reason.
+local Move = {}
+local MOVE_PRIORITY = { emergency = 3, evade = 2, nav = 1 }
+local MOVE_ARRIVE = { emergency = 2, evade = 2.5, nav = 3 }
+function Move.request(mode, goal, kind, opts)
+    if not goal then return end
+    kind = kind or "nav"
+    opts = opts or {}
+    local source = opts.source or mode
+    local now = os.clock()
+    local current = state.moveCmd
+    local prio = MOVE_PRIORITY[kind] or 1
+    if current and not current.expired then
+        local curPrio = MOVE_PRIORITY[current.kind] or 1
+        if prio < curPrio and now < (current.expiry or math.huge) then
+            state.moveReason = "preempt-denied:" .. source .. "<" .. current.source
+            return false
+        end
+    end
+    if current and current.source == source and current.goal then
+        if (goal - current.goal).Magnitude > 8 then
+            state.moveReplans = (state.moveReplans or 0) + 1
+        end
+    elseif current and (goal - (current.goal or goal)).Magnitude <= 8 then
+        -- Same destination re-filed under a different source (e.g. escape
+        -- carry re-asserting the walk goal): arbitration noise, not a plan
+        -- change. Do not count it.
+    else
+        state.moveReplans = (state.moveReplans or 0) + 1
+    end
+    state.moveCmd = { source = source, mode = mode, goal = goal, kind = kind,
+        at = now, expiry = now + (opts.ttl or 1.5),
+        teleport = opts.teleport, walkGoal = opts.walkGoal,
+        threat = opts.threat, bypass = opts.bypass }
+    state.moveReason = "cmd:" .. source
+    return true
+end
+function Move.execute(humanoid, rootPart, target, now)
+    local cmd = state.moveCmd
+    if not cmd or cmd.consumed then return false end
+    if now >= (cmd.expiry or 0) then
+        cmd.expired = true
+        state.moveReason = "expired:" .. cmd.source
+        state.moveCmd = nil
+        return false
+    end
+    local arriveR = MOVE_ARRIVE[cmd.kind] or 3
+    -- Arrival consumes nav commands (next waypoint/goal), but NEVER evade or
+    -- emergency commands: consuming them on arrival is what caused
+    -- evade->nav->evade flip-flop every tick (stop-start oscillation).
+    -- Escapes persist until expiry while danger re-asserts them each tick.
+    if cmd.kind == "nav" and (cmd.goal - rootPart.Position).Magnitude <= arriveR then
+        cmd.consumed = true
+        state.moveReason = "arrived:" .. cmd.source
+        state.moveCmd = nil
+        return true
+    end
+    -- Unified hazard gate: non-emergency commands never walk INTO danger.
+    -- Evades bypass (they were planned with survival margins); emergencies
+    -- bypass (teleport validity checked separately).
+    if cmd.kind == "nav" and CFG.AUTO_DODGE and #state.activeZones > 0 then
+        local minClear = math.huge
+        for _, zone in ipairs(state.activeZones) do
+            minClear = math.min(minClear, ThreatGeometry.clearance(zone, cmd.goal, CFG.HAZARD_MARGIN))
+        end
+        if minClear < -2 then
+            state.moveReason = "goal-in-danger:" .. cmd.source
+            humanoid:MoveTo(rootPart.Position)
+            state.motionMode = "safety-hold"
+            return true
+        end
+    end
+    if cmd.teleport then
+        if performDodgeTeleport(humanoid, rootPart, cmd.goal, target, cmd.threat or "move", now) then
+            cmd.consumed = true
+            state.moveCmd = nil
+            return true
+        end
+        -- Teleport denied (budget/cooldown/geometry): walk the full goal the
+        -- blink was covering instead of stopping at the partial step.
+        cmd.teleport = nil
+        if cmd.walkGoal then cmd.goal = cmd.walkGoal end
+        state.moveReason = "teleport-denied:" .. cmd.source
+    end
+    issueMove(humanoid, cmd.goal, cmd.mode or (cmd.kind == "evade" and "evade" or "nav"), now, cmd.bypass)
+    return true
+end
+function Move.clear(reason)
+    state.moveCmd = nil
+    state.moveReason = reason or "cleared"
 end
 
 local function chooseFallbackStep(rootPart, goal, target)
@@ -1235,7 +1491,7 @@ local function followGoal(humanoid, rootPart, goal, mode, now, target)
     -- corner from leaving the Humanoid idle while the long path is retried.
     if state.fallbackGoal and now < state.fallbackUntil then
         if (rootPart.Position - state.fallbackGoal).Magnitude > CFG.WAYPOINT_REACH_THRESHOLD then
-            issueMove(humanoid, state.fallbackGoal, mode, now)
+            Move.request(mode, state.fallbackGoal, "nav", { source = "fallback-carry" })
             return
         end
         state.fallbackGoal, state.fallbackUntil = nil, 0
@@ -1253,7 +1509,7 @@ local function followGoal(humanoid, rootPart, goal, mode, now, target)
             if not state.directTravel then clearPath() end
             state.directTravel, state.pathMode = true, mode
             state.pathStatus = "Pathfinding: direct walk"
-            issueMove(humanoid, goal, mode, now)
+            Move.request(mode, goal, "nav", { source = "direct" })
             return
         end
     end
@@ -1270,7 +1526,7 @@ local function followGoal(humanoid, rootPart, goal, mode, now, target)
         local stairBase = surveyUphill(rootPart, goal)
         if stairBase and (stairBase - rootPart.Position).Magnitude > CFG.WAYPOINT_REACH_THRESHOLD then
             state.fallbackGoal, state.fallbackUntil = stairBase, now + 2.0
-            issueMove(humanoid, stairBase, mode, now)
+            Move.request(mode, stairBase, "nav", { source = "stairs" })
             return
         end
     end
@@ -1386,7 +1642,7 @@ local function followGoal(humanoid, rootPart, goal, mode, now, target)
         if #state.waypoints > 0 then clearPath() end
         if (goal - rootPart.Position).Magnitude <= CFG.DIRECT_PATH_DISTANCE
             and walkingSegmentClear(rootPart, goal, target) then
-            issueMove(humanoid, goal, mode, now)
+            Move.request(mode, goal, "nav", { source = "path-exhausted" })
         else
             if now - (state.lastPendingStep or -math.huge) >= 0.2 then
                 state.lastPendingStep = now
@@ -1396,9 +1652,9 @@ local function followGoal(humanoid, rootPart, goal, mode, now, target)
                         state.routeFails = (state.routeFails or 0) + 1
                     end
                     state.fallbackGoal, state.fallbackUntil = fallback, now + 0.6
-                    issueMove(humanoid, fallback, mode, now)
+                    Move.request(mode, fallback, "nav", { source = "pending-step" })
                 else
-                    humanoid:MoveTo(rootPart.Position)
+                    Move.request(mode, rootPart.Position, "nav", { source = "hold-nostep", ttl = 0.4 })
                 end
             end
         end
@@ -1413,12 +1669,26 @@ local function followGoal(humanoid, rootPart, goal, mode, now, target)
         local fallback = chooseFallbackStep(rootPart, goal, target)
         if fallback then
             state.fallbackGoal, state.fallbackUntil = fallback, now + 1.6
-            issueMove(humanoid, fallback, mode, now)
+            Move.request(mode, fallback, "nav", { source = "stale-segment" })
         end
         return
     end
     if waypoint.Action == Enum.PathWaypointAction.Jump and humanoid.FloorMaterial ~= Enum.Material.Air then humanoid.Jump = true end
-    issueMove(humanoid, waypoint.Position, mode, now)
+    -- Waypoint lookahead: when the next waypoint is close behind this one and
+    -- the segment to it is clear, aim at the further one instead of
+    -- stop-starting on every navmesh node. Cuts direction changes on open
+    -- ground without cutting corners through walls.
+    do
+        local nextWp = state.waypoints[state.currentWaypointIndex + 1]
+        if nextWp and (nextWp.Position - waypoint.Position).Magnitude <= 10
+            and not hasBlockingRay(rootPart.Position + Vector3.new(0, 2, 0),
+                nextWp.Position + Vector3.new(0, 2, 0), rootPart.Parent, target) then
+            waypoint = nextWp
+            state.currentWaypointIndex = state.currentWaypointIndex + 1
+            updateWaypointHighlight(state.currentWaypointIndex)
+        end
+    end
+    Move.request(mode, waypoint.Position, "nav", { source = "waypoint" })
 end
 
 local function chooseRecoveryGoal(rootPart, goal, target)
@@ -1510,6 +1780,13 @@ local function updateProgress(humanoid, rootPart, goal, target, now)
     state.stuckStartTime = now
     state.stuckCount = 0
     state.routeFails = (state.routeFails or 0) + 1
+    if state.telemetry then
+        state.telemetry.recoveries = state.telemetry.recoveries + 1
+        state.telemetry.stuckEvents = state.telemetry.stuckEvents + 1
+        state.telemetry.noProgressSec = state.telemetry.noProgressSec
+            + math.max(0, now - (state.telemetry.lastNoProgAt or state.telemetry.startedAt))
+        state.telemetry.lastNoProgAt = now
+    end
     -- NOTE: no clearPath() here. Clearing bumps the path generation, which
     -- discards the in-flight repath result, which stalls again, which clears
     -- again: a permanent loop where no path ever survives to be walked.
@@ -1538,6 +1815,7 @@ local function updateProgress(humanoid, rootPart, goal, target, now)
                 else
                     recordSegmentFail("anchor:" .. tostring(state.routeAnchorIndex), now)
                 end
+                noteEdgeFail(state.routeAnchorIndex)
             end
             return true
         end
@@ -1546,7 +1824,7 @@ local function updateProgress(humanoid, rootPart, goal, target, now)
     local recovery = chooseRecoveryGoal(rootPart, goal, target)
     if recovery then
         state.fallbackGoal, state.fallbackUntil = recovery, now + 1.6
-        issueMove(humanoid, recovery, "recovery", now)
+        Move.request("recovery", recovery, "nav", { source = "stuck-recovery" })
         state.pathStatus = "Pathfinding: lateral recovery"
     end
     return true
@@ -1794,6 +2072,10 @@ local function crowdDistance(position)
     return math.min(28, enemyClearance(position) + math.clamp(CFG.COMBAT_MIN_DISTANCE, 6, 22))
 end
 
+-- Forward declaration: defined with the windup detector below; escape
+-- planning (above) keys smash-geometry behavior off it.
+local smashZonesActive
+
 local function findEscapeGoal(rootPart, targetRoot)
     local params = buildRaycastParams(rootPart.Parent, targetRoot.Parent)
     params.RespectCanCollide = true
@@ -1817,7 +2099,7 @@ local function findEscapeGoal(rootPart, targetRoot)
         local desiredError = math.abs(targetDistance - CFG.COMBAT_DISTANCE)
         return orbitAlignment * 18 - outward * 24 - desiredError * 2, targetDistance
     end
-    if targetRoot.Parent.Name == "Ancient Temple Protector" then
+    if targetRoot.Parent.Name == "Ancient Temple Protector" or smashZonesActive() then
         local toward = targetRoot.Position - rootPart.Position
         toward = Vector3.new(toward.X, 0, toward.Z)
         local originalDistance = toward.Magnitude
@@ -1875,7 +2157,10 @@ local function findEscapeGoal(rootPart, targetRoot)
     end
     local originalCrowd = crowdDistance(rootPart.Position)
     local originalDist = (rootPart.Position - targetRoot.Position).Magnitude
-    local isProt = targetRoot.Parent and targetRoot.Parent.Name == "Ancient Temple Protector"
+    -- Smash-geometry behavior (was Protector-name-gated): dodge FORWARD,
+    -- never back, when expanding slam walls are on the field. Retreating
+    -- from a slam just sets up the next volley at range.
+    local isProt = smashZonesActive()
     -- Young smash corridors: exit strictly sideways. Generic gradient steps
     -- waste the ~1s windup on diagonals that never leave the corridor.
     do
@@ -2157,7 +2442,7 @@ local function effectiveSpellRange(profile)
     return profile.range or (CFG.SPELL_RANGE_OVERRIDE > 0 and CFG.SPELL_RANGE_OVERRIDE) or CFG.ATTACK_RANGE
 end
 
-local function performDodgeTeleport(humanoid, rootPart, destination, target, threat, now)
+performDodgeTeleport = function(humanoid, rootPart, destination, target, threat, now)
     if not destination or humanoid.FloorMaterial == Enum.Material.Air then return false end
     local delta = destination - rootPart.Position
     if not canTeleportDodge(now, delta.Magnitude, threat) then return false end
@@ -2171,6 +2456,7 @@ local function performDodgeTeleport(humanoid, rootPart, destination, target, thr
     rootPart.CFrame = rootPart.CFrame + delta
     table.insert(state.dodgeHistory, { at = now, distance = delta.Magnitude })
     logThreat("tp", { distance = math.floor(delta.Magnitude * 10) / 10 })
+    if state.telemetry then state.telemetry.dodges = state.telemetry.dodges + 1 end
     state.lastDodgeTime = now
     state.safetyUntil = now + 0.75
     state.dodgeCount = state.dodgeCount + 1
@@ -2311,6 +2597,9 @@ local function castSkill()
 end
 
 local function stopMovement(humanoid, rootPart)
+    -- Always drop the pending command first: a stale goal must never
+    -- re-issue after a halt, even when the halt itself is redundant.
+    Move.clear("stop")
     if state.motionMode == "hold" and not state.motionGoal then return end
     humanoid:MoveTo(rootPart.Position)
     state.motionMode = "hold"
@@ -2322,9 +2611,17 @@ end
 -- Protector windup tell: hands rest at body level; a fast raise starts the
 -- smash volley. A freshly started animation track on the boss counts too.
 -- So does the boss snapping to face the player (the slam aims at whoever it
--- faces). Returns true on the tick the tell is detected.
+-- faces). Boss-agnostic: any boss can produce these tells (hand-raise only
+-- applies when hand models exist). Returns true on the tick detected.
+local function smashZonesActiveImpl()
+    for _, zone in ipairs(state.activeZones) do
+        if zone.shape == "ProtectorSmash" then return true end
+    end
+    return false
+end
+smashZonesActive = smashZonesActiveImpl
 local function protectorWindup(target, targetRoot, rootPart, now)
-    if not target or target.Name ~= "Ancient Temple Protector" then
+    if not target then
         state.windHands, state.windTracks, state.faceHist = nil, nil, nil
         return false
     end
@@ -2393,12 +2690,16 @@ local function meleeThreat(rootPart)    local threat, closest = nil, math.huge
     return threat
 end
 
+-- Blink planner: decides walk-vs-blink for an escape step and files it as a
+-- movement command. Returns true when an emergency teleport was requested
+-- (Move.execute performs it); the walk goal is then covered by the caller's
+-- evade request. Never moves directly — arbitration owns all motion.
 local function dodgeAlongEscape(humanoid, rootPart, goal, target, threat, now, forceBlink)
-    if not threat then return end
+    if not threat then return false end
     local delta = goal - rootPart.Position
-    if delta.Magnitude < 0.5 then return end
+    if delta.Magnitude < 0.5 then return false end
     local step = rootPart.Position + delta.Unit * math.min(CFG.DODGE_LATERAL_DISTANCE, delta.Magnitude)
-    if enemyClearance(step) <= enemyClearance(rootPart.Position) and typeof(threat) == "Instance" and threat:IsA("Model") then return end
+    if enemyClearance(step) <= enemyClearance(rootPart.Position) and typeof(threat) == "Instance" and threat:IsA("Model") then return false end
     -- Teleport budget is reserved for telegraphed attacks (zone parts and
     -- announcements). Melee separation walks: spending the 3-per-3s budget
     -- dodging bodies leaves nothing for the one-shot windup that follows.
@@ -2407,8 +2708,10 @@ local function dodgeAlongEscape(humanoid, rootPart, goal, target, threat, now, f
     -- walking is smoother on foot; the blink is for real distance.
     -- Emergencies (least-bad) and intentional bursts (windup) always blink.
     if telegraphed and CFG.TELEPORT_DODGE and (forceBlink or delta.Magnitude > 12) then
-        performDodgeTeleport(humanoid, rootPart, step, target, threat, now)
+        return Move.request("evade", step, "emergency",
+            { source = "blink", threat = threat, teleport = true, walkGoal = goal, ttl = 0.8 })
     end
+    return false
 end
 
 -- Protector separation goes sideways, never backward. Radial escapes back
@@ -2513,8 +2816,32 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
     local crowd = crowdDistance(rootPart.Position)
     local crowdLimit = math.clamp(CFG.COMBAT_MIN_DISTANCE, 6, 22)
     local clearance = enemyClearance(rootPart.Position)
-    local isProt = target.Name == "Ancient Temple Protector"
+    local isProt = target.Name == "Ancient Temple Protector" or smashZonesActive()
     local isFast = CFG.FAST_CARRY and not CFG.NORTHERN_COMBAT
+    -- FAST CARRY threat gating: the carrier one-shots everything on these
+    -- maps, so telegraphs that have not touched the character are not worth
+    -- leaving DPS position for. Escape only when INSIDE danger (min
+    -- clearance < -1) or in melee contact; otherwise hold and burn. Full
+    -- reactive dodging stays on for Northern Lands.
+    if isFast then
+        local minClearance = math.huge
+        for _, activeZone in ipairs(state.activeZones) do
+            minClearance = math.min(minClearance,
+                ThreatGeometry.clearance(activeZone, rootPart.Position, CFG.HAZARD_MARGIN))
+        end
+        state.fastHold = risk > 0 and minClearance >= -1
+            and not contactThreat and clearance >= 0
+        if state.fastHold then
+            if state.moveOwner == "EMERGENCY_DODGE" then
+                restoreNavGoal()
+                setMoveOwner("idle")
+            end
+            state.escapeGoal = nil
+            return false
+        end
+    else
+        state.fastHold = false
+    end
     -- No crowd-retreats against the Protector: backing off for spacing is
     -- what walks the fight backward into the pit and strands it at range.
     -- Zones and real contact still dodge; spacing alone never retreats.
@@ -2543,22 +2870,37 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
             state.escapeReason = "Breaking melee contact"
             state.status = state.escapeReason
             dodgeAlongEscape(humanoid, rootPart, separation, target, contactThreat, now)
-            issueMove(humanoid, separation, "evade", now)
+            Move.request("evade", separation, "evade", { source = "separation" })
             return true
         end
         -- A blocked backward step still permits a lateral escape search.
     end
-    -- Smash response (Protector only): the slam is a full-arena expanding
-    -- rectangle wall. Backing away corners you against the arena edge, so
-    -- this does the opposite: phase 1 closes distance toward the boss while
-    -- the rectangles are small, phase 2 strafes the side with more open
-    -- space. Regular attacks keep the normal backward dodge below; only
-    -- Smash behaves this way (attack-dependent dodge direction).
-    if target.Name == "Ancient Temple Protector" then
-        if protectorWindup(target, targetRoot, rootPart, now) then
-            state.smashStrafeUntil = now + 2.2
-            logThreat("windup", "smash")
-        end
+    -- Smash response (any boss): expanding-rectangle slam walls are answered
+    -- by closing distance while they are small, then strafing the open side.
+    -- Triggered by geometry (ProtectorSmash zones) or the generic windup
+    -- tell, never by boss name. Regular attacks keep the normal escape below.
+    -- Windup detection runs for any boss, but throttled on fast maps: no
+    -- zones, no big boss, no watch. (Animator track polling every tick is
+    -- wasted on one-shot trash.)
+    local bossHum = target:FindFirstChildOfClass("Humanoid")
+    local targetMaxHp = bossHum and bossHum.MaxHealth or 0
+    -- Smash tells are only meaningful for smash-capable bosses: the Protector
+    -- by name, any boss with live ProtectorSmash geometry, or boss-grade
+    -- targets (1e9+ MaxHP). Facing-snap alone fires on every melee mob that
+    -- turns toward the player — trusting it for trash causes permanent
+    -- "windup" strafing instead of fighting.
+    local smashCapable = target.Name == "Ancient Temple Protector"
+        or smashZonesActive() or targetMaxHp >= 1e9
+    local windup = false
+    if smashCapable and (not isFast or #state.activeZones > 0 or targetMaxHp >= 1e9) then
+        windup = protectorWindup(target, targetRoot, rootPart, now)
+    end
+    if windup then
+        state.smashStrafeUntil = now + 2.2
+        logThreat("windup", "smash")
+    end
+    if target.Name == "Ancient Temple Protector" or smashZonesActive()
+        or (smashCapable and state.smashStrafeUntil and now < state.smashStrafeUntil) then
         if state.smashStrafeUntil and now < state.smashStrafeUntil then
             local away = Vector3.new(rootPart.Position.X - targetRoot.Position.X, 0, rootPart.Position.Z - targetRoot.Position.Z)
             local dist = away.Magnitude
@@ -2597,7 +2939,7 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
                 state.escapeReason = dist > 20 and "Closing on smash windup" or "Strafing smash by open space"
                 state.status = state.escapeReason
                 dodgeAlongEscape(humanoid, rootPart, goal, target, "smash" .. math.floor(now * 10), now, true)
-                issueMove(humanoid, goal, "evade", now)
+                Move.request("evade", goal, "evade", { source = "smash-response" })
                 return true
             end
             -- No valid smash goal: fall through to the regular escape logic.
@@ -2653,7 +2995,8 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
             state.status = state.escapeReason or "Avoiding nearby enemies"
             claimDodge()
             dodgeAlongEscape(humanoid, rootPart, state.escapeGoal, target, zone and zone.id or contactThreat, now)
-            issueMove(humanoid, state.escapeGoal, "evade", now, contMargin < CFG.HAZARD_MARGIN)
+            Move.request("evade", state.escapeGoal, "evade",
+                { source = "escape-carry", bypass = contMargin < CFG.HAZARD_MARGIN })
             return true
             end
         end
@@ -2690,7 +3033,7 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
                 state.status = state.escapeReason
                 logThreat("escape", state.escapeReason)
                 dodgeAlongEscape(humanoid, rootPart, backup, target, zone and zone.id or contactThreat, now, true)
-                issueMove(humanoid, backup, "evade", now, true)
+                Move.request("evade", backup, "evade", { source = "least-bad", bypass = true })
                 return true
             end
         end
@@ -2715,7 +3058,7 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
     state.status = state.escapeReason
     logThreat("escape", state.escapeReason)
     state.lastEscapeAt = now
-    issueMove(humanoid, goal, "evade", now)
+    Move.request("evade", goal, "evade", { source = "escape" })
     return true
 end
 
@@ -2744,6 +3087,7 @@ local function controllerTick()
         CFG.STUCK_TIMEOUT = 0.75
     end
     pcall(function()
+        getgenv().DQNavError = nil
         local charPos = rootPart.Position
         local tgt = state.currentTarget
         local tgtRoot = tgt and getRootPart(tgt)
@@ -2801,6 +3145,25 @@ local function controllerTick()
             evasions = state.attackStats.evasions, attackHits = state.attackStats.hits,
             streak = state.fallbackStreak or 0, doorHold = state.doorHold,
             hotCells = (function() local n = 0 for _ in pairs(state.cellCost) do n = n + 1 end return n end)(),
+            skips = state.routeSkips or 0,
+            recov = state.telemetry and state.telemetry.recoveries or 0,
+            stuckEv = state.telemetry and state.telemetry.stuckEvents or 0,
+            dodges = state.telemetry and state.telemetry.dodges or 0,
+            deaths = state.telemetry and state.telemetry.deaths or 0,
+            noProg = state.telemetry and math.floor(state.telemetry.noProgressSec * 10) / 10 or 0,
+            fastHold = state.fastHold,
+            routeHist = (function()
+                local e = routeMapEntry(false)
+                if not e then return nil end
+                return string.format("runs%d/comp%d/best%d", e.runs or 0, e.completions or 0, e.bestTimeSec or 0)
+            end)(),
+            move = (function()
+                local c = state.moveCmd
+                if not c then return tostring(state.moveReason) end
+                return string.format("%s:%s>%.0f,%.0f,%.0f age%.1f rp%d %s",
+                    c.kind, c.source, c.goal.X, c.goal.Y, c.goal.Z,
+                    now - c.at, state.moveReplans or 0, tostring(state.moveReason))
+            end)(),
         }
         -- Full pattern DB for controlled per-pattern tests (read-only).
         pcall(function()
@@ -2810,6 +3173,17 @@ local function controllerTick()
             }
         end)
     end)
+    local navOk, navErr = pcall(function() return getgenv().DQNav ~= nil end)
+    if not navOk or getgenv().DQNav == nil then
+        -- Surface the swallowed error: re-run the two new IIFEs verbosely.
+        local _, e1 = pcall(function()
+            local n = 0
+            for _ in pairs(state.cellCost) do n = n + 1 end
+            return n
+        end)
+        local _, e2 = pcall(function() return routeMapEntry(false) end)
+        getgenv().DQNavError = tostring(e1) .. " // " .. tostring(e2)
+    end
     CFG.ATTACK_RANGE = CFG.SPELL_RANGE_OVERRIDE > 0 and CFG.SPELL_RANGE_OVERRIDE or 26
     if CFG.SMART_FARM then
         local snapshots = abilities.Snapshot(now)
@@ -2854,16 +3228,26 @@ local function controllerTick()
         return
     end
 
-    -- Burn phase: while the Protector lives, it is the only target. Chasing
-    -- adds walks the bot across resolving volleys for no damage gain.
-    if target.Name ~= "Ancient Temple Protector" then
+    -- Burn phase: while a boss-grade enemy (highest MaxHealth on the field)
+    -- lives, it is the only target. Chasing adds walks the bot across
+    -- resolving volleys for no damage gain. Boss-graded by health, not name.
+    do
+        local bestBoss, bestMaxHp = nil, 1e9
         for _, model in ipairs(state.cachedTargets) do
-            if model.Name == "Ancient Temple Protector" and isValidTarget(model) and model:IsDescendantOf(Workspace) then
-                target = model
-                state.lockedTarget = model
-                local bossRoot = getRootPart(model)
+            if model ~= target and isValidTarget(model) and model:IsDescendantOf(Workspace) then
+                local hum = model:FindFirstChildOfClass("Humanoid")
+                if hum and hum.MaxHealth >= bestMaxHp then
+                    bestBoss, bestMaxHp = model, hum.MaxHealth
+                end
+            end
+        end
+        if bestBoss then
+            local currentMaxHp = targetHumanoid and targetHumanoid.MaxHealth or 0
+            if currentMaxHp < bestMaxHp then
+                target = bestBoss
+                state.lockedTarget = bestBoss
+                local bossRoot = getRootPart(bestBoss)
                 if bossRoot then distance = (bossRoot.Position - rootPart.Position).Magnitude end
-                break
             end
         end
     end
@@ -2925,6 +3309,7 @@ local function controllerTick()
         end
         faceEnemy(humanoid, rootPart, targetRoot)
         if distance <= CFG.ATTACK_RANGE and not hasBlockingRay(rootPart.Position, targetRoot.Position, character, target) then castSkill() end
+        Move.execute(humanoid, rootPart, target, now)
         return
     end
 
@@ -2939,6 +3324,7 @@ local function controllerTick()
             state.status = "Following map route: " .. routeAnchor.name
             followGoal(humanoid, rootPart, routeGoal, "map-route", now, target)
             updateProgress(humanoid, rootPart, routeGoal, target, now)
+            Move.execute(humanoid, rootPart, target, now)
             return
         end
         -- Target on a higher level: the flat navmesh route walks underneath
@@ -2969,6 +3355,7 @@ local function controllerTick()
                 state.pathStatus = "Climbing to " .. target.Name
                 state.status = state.pathStatus
                 updateProgress(humanoid, rootPart, higher, target, now)
+                Move.execute(humanoid, rootPart, target, now)
                 return
             end
         end
@@ -3050,8 +3437,9 @@ local function controllerTick()
                 state.wanderUntil = now + 6
             end
             state.status = "Holding for wave/door: " .. target.Name
-            if state.wanderGoal then issueMove(humanoid, state.wanderGoal, "hold", now) end
+            if state.wanderGoal then Move.request("hold", state.wanderGoal, "nav", { source = "wander" }) end
             if distance <= CFG.ATTACK_RANGE then castSkill() end
+            Move.execute(humanoid, rootPart, target, now)
             return
         end
         state.status = "Routing around obstacle to " .. target.Name
@@ -3059,6 +3447,7 @@ local function controllerTick()
             and groundPosition(targetRoot.Position - targetRoot.CFrame.LookVector * 16, character, target)) or targetRoot.Position
         followGoal(humanoid, rootPart, approachGoal, "approach", now, target)
         updateProgress(humanoid, rootPart, approachGoal, target, now)
+        Move.execute(humanoid, rootPart, target, now)
         return
     end
     state.navigationPhase = "combat"
@@ -3069,6 +3458,7 @@ local function controllerTick()
         followGoal(humanoid, rootPart, protectorApproach, "approach", now, target)
         updateProgress(humanoid, rootPart, protectorApproach, target, now)
         if distance <= CFG.ATTACK_RANGE then castSkill() end
+        Move.execute(humanoid, rootPart, target, now)
         return
     end
     if not protectorRear and CFG.FARM_POSITION == "Nearest" and distance >= CFG.COMBAT_MIN_DISTANCE and distance <= CFG.COMBAT_MAX_DISTANCE then
@@ -3081,6 +3471,7 @@ local function controllerTick()
             -- Emergency dodges still preempt via handleSafety above.
             stopMovement(humanoid, rootPart)
             castSkill()
+            Move.execute(humanoid, rootPart, target, now)
             return
         end
         -- NORTHERN COMBAT: keep a small orbit while casting so a target in
@@ -3095,6 +3486,7 @@ local function controllerTick()
             followGoal(humanoid, rootPart, desiredPosition, "combat", now, target)
         end
         castSkill()
+        Move.execute(humanoid, rootPart, target, now)
         return
     end
 
@@ -3126,13 +3518,15 @@ local function controllerTick()
             if safeEnemyStep(rootPart.Position, step)
                 and ThreatGeometry.segmentSafe(state.activeZones, rootPart.Position, step, CFG.HAZARD_MARGIN)
                 and walkingSegmentClear(rootPart, step, target) then
-                performDodgeTeleport(humanoid, rootPart, step, target, "creep", now)
+                Move.request("combat", step, "emergency",
+                    { source = "creep", threat = "creep", teleport = true, walkGoal = desiredPosition, ttl = 0.8 })
             end
         end
     end
     if (Vector3.new(desiredPosition.X - rootPart.Position.X, 0, desiredPosition.Z - rootPart.Position.Z)).Magnitude < 2 then
         stopMovement(humanoid, rootPart)
         if distance <= CFG.ATTACK_RANGE then castSkill() end
+        Move.execute(humanoid, rootPart, target, now)
         return
     end
     state.status = protectorRear and "Circling Protector in spell range"
@@ -3140,6 +3534,7 @@ local function controllerTick()
     followGoal(humanoid, rootPart, desiredPosition, "combat", now, target)
     updateProgress(humanoid, rootPart, desiredPosition, target, now)
     if distance <= CFG.ATTACK_RANGE then castSkill() end
+    Move.execute(humanoid, rootPart, target, now)
 end
 
 connect(RunService.RenderStepped, function()
@@ -3168,7 +3563,7 @@ connect(RunService.Heartbeat, function()
     state.updateBusy = false
     if not ok and now - lastError >= 2 then
         lastError = now
-        warn("[EnemyWalker] controller error: " .. tostring(err))
+        warn("[EnemyWalker] controller error: " .. tostring(err) .. "\n" .. tostring(debug.traceback()))
     end
 end)
 
@@ -3199,6 +3594,8 @@ local function setRunning(running)
         state.moveOwner, state.savedNavGoal, state.savedNavMode = "idle", nil, nil
         state.navGoalKey, state.navBestDist, state.navBestAt = nil, math.huge, 0
         state.lastVerifiedProgressAt, state.navTransitions = os.clock(), 0
+        state.telemetry = { recoveries = 0, stuckEvents = 0, dodges = 0,
+            deaths = 0, noProgressSec = 0, startedAt = os.clock() }
         state.pathFailCount = 0
         state.firstFailedSegment, state.lastFailedSegment = nil, nil
         state.doomWatch, state.doomFired = nil, nil
@@ -3241,6 +3638,9 @@ local function watchHealth(character)
     if state.healthConnection then state.healthConnection:Disconnect() end
     local previous = humanoid.Health
     state.healthConnection = connect(humanoid.HealthChanged, function(health)
+        if health <= 0 and previous > 0 and state.telemetry then
+            state.telemetry.deaths = state.telemetry.deaths + 1
+        end
         if state.running and not state.closed and character == player.Character and health < previous - 0.01 then
             state.damageEvents = state.damageEvents + 1
             state.lastDamage = { amount = previous - health, at = os.clock(), health = health,
@@ -3350,6 +3750,7 @@ return {
     State = state,
     SetRunning = setRunning,
     Shutdown = shutdown,
+    NoteCompletion = function(durationSec) noteCompletion(durationSec) end,
     AbilityStatus = function() return abilities.Snapshot(os.clock()) end,
     SetAbilityInventory = abilities.SetInventory,
     AbilityProfile = FarmPlanner.profile,
