@@ -1441,19 +1441,23 @@ function Move.execute(humanoid, rootPart, target, now)
     -- safe -> walk on; the physical step guards below still vet the actual
     -- path segment. Reason + clearance are audit-logged either way.
     if cmd.kind == "nav" and CFG.AUTO_DODGE and #state.activeZones > 0 then
-        local goalClear, charClear = math.huge, math.huge
+        local goalClear, charClear2 = math.huge, math.huge
         local worstZone = nil
         for _, zone in ipairs(state.activeZones) do
             local g = ThreatGeometry.clearance(zone, cmd.goal, CFG.HAZARD_MARGIN)
             if g < goalClear then goalClear = g end
-            local c = ThreatGeometry.clearance(zone, rootPart.Position, CFG.HAZARD_MARGIN)
-            if c < charClear then charClear, worstZone = c, zone end
+            -- Body truth uses the SMALL margin (2): the character's real
+            -- volume (~1.5 stud radius) plus a step of grace. The comfort
+            -- margin band beyond that is graze, not collision: holding at
+            -- +7 studs margin-0 clearance was the reported false stop.
+            local c = ThreatGeometry.clearance(zone, rootPart.Position, 2)
+            if c < charClear2 then charClear2, worstZone = c, zone end
         end
-        if goalClear < -2 and charClear >= -1 then
+        if goalClear < -2 and charClear2 >= -0.5 then
             state.moveReason = "goal-in-danger-but-safe:" .. cmd.source
             logHold("goal-in-danger-but-safe", worstZone, rootPart, cmd.goal)
             -- Fall through to walking: the step guards vet the real path.
-        elseif charClear < -1 then
+        elseif charClear2 < -0.5 then
             state.moveReason = "holding-inside-danger:" .. cmd.source
             logHold("holding-inside-danger", worstZone, rootPart, cmd.goal)
             humanoid:MoveTo(rootPart.Position)
