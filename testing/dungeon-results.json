@@ -159,9 +159,9 @@
     },
     {
       "access": "unknown",
-      "attempts": 30,
+      "attempts": 31,
       "availability": "visible-in-queue",      "clears": 0,
-      "deaths": 88,
+      "deaths": 102,
       "difficulty": "unknown",
       "damageTaken": 432927456,
       "durationSec": 0,
@@ -197,12 +197,13 @@
         "Attempt 27: NO CLEAR (boss 40% then run ended). 0/27. Lobby-driving for Aquatic Temple interrupted by bridge drop; user queued Northern Lands again.",
         "Attempt 28: NO CLEAR (outOfTime, boss 61%). 0/28. Lobby config switched to Aquatic Temple in fresh-lobby window (in-memory autosave had been clobbering file edits).",
         "Attempt 29 (unified-arb + Stage 2 build, NORTHERN profile): job 1400e528. First Northern run with new code. Northern Mage grind: mage 1.13Q/1.57Q (72%) at 5 min, 10 deaths, 0 kills, timer ended run. Attack memory verdict: precast s938/warn0.03s/size52/targeting=FIXED/hits25 — telegraphs are fixed-position and near-instant (0.03s warn = undodgeable reactively; must pre-position, which predictedRisk does). Turn rate 39% (vs 70% Aquatic baseline). Arbitration clean (preempt-denied readouts), zero tick errors. Gear/survival wall stands: trash 2-shots, DPS too slow on Insane. No clear observed, NOT counted as clear.",
-        "Attempt 30 (safety-fix build, NORTHERN profile): job 38027505. Run ended <3 min after bundle load (back in lobby before first probe). No telemetry captured; no clear observed, NOT counted as clear."
+        "Attempt 30 (safety-fix build, NORTHERN profile): job 38027505. Run ended <3 min after bundle load (back in lobby before first probe). No telemetry captured; no clear observed, NOT counted as clear.",
+        "Attempt 31 (commit a9ecaa3 source digest 753c63b17b, NORTHERN profile): job 137209d7. Reached Bob The Frost Giant after defeating Midgardian Champion; at least 14 deaths observed. Live room-4 geometry identified Workspace.secondBossCrystals with red, green, and yellow crystal/rune parts. The initial diagnostic was polluted by cyan PathWaypoints and the run ended before a focused probe captured the homing orb, so no orb identifier or color-match behavior is claimed. No clear observed, NOT counted as clear."
       ],
-      "failures": 30,
+      "failures": 31,
       "hitlessClears": 0,
-      "lastCommit": "7d71766",
-      "lastTested": "2026-09-21T06:06:38Z",
+      "lastCommit": "a9ecaa3",
+      "lastTested": "2026-09-23T03:28:55Z",
       "name": "Northern Lands",
       "status": "blocked"
     },

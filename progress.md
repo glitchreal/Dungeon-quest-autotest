@@ -194,3 +194,10 @@
 - `AGENTS.md`: fixed stale push-target line to `glitchreal/Dungeon-quest-autotest`.
 - Gates: A (build) PASS. B (new revision live in-client) PENDING — live client `VanguardAttacker` in lobby (place 77649408247578) has NO build stamp and NO DQNav; loading the new bundle needs the standing approval for one controlled lobby load test. C–H not yet attempted; Northern Lands untouched (still blocked at 0/28, no repeats run).
 - Need from user: (a) approval for one controlled local-build load test in the lobby, (b) private-server link if recovery is ever needed, (c) explicit approval before any overnight run.
+
+## Attempt 31 — Northern Lands Bob mechanic probe (FAILED, no clear, 2026-09-23)
+- Loaded committed safety-fix source (`a9ecaa3`, bundle source digest `753c63b17b`) into the already-running Northern Lands instance; controller reported the `northern` profile.
+- Defeated Midgardian Champion and reached Bob The Frost Giant in room 4; at least 14 deaths were observed before the run returned to the lobby.
+- Confirmed Bob's mechanic targets under `Workspace.secondBossCrystals`: red (`House Rune`, RGB 255/38/38), green (`Hex Rune`, RGB 49/255/38), and yellow (`yellow`/`Star Rune`, RGB 255/248/161 and 255/238/38).
+- The first bounded probe captured cyan `PathWaypoints_*` visualization parts and filled its 60-entry buffer. A corrected probe excluded those parts, but the MCP client teleported to the lobby before another orb cast. The homing orb's runtime name/model/color remains unverified; no guessed handler was added.
+- Required next evidence: one Bob orb cast with the focused probe active. Then implement movement ownership for `BOSS_MECHANIC`: identify the orb targeting this player, match its color to the verified crystal, lead it along a traversable approach, and relinquish ownership immediately when the orb disappears. Emergency dodge remains higher priority and the 8-stud blink limits remain unchanged.
