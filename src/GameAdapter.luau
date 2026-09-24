@@ -67,13 +67,45 @@ end
 function Adapter.findLobby(raid)
     local games = workspace:FindFirstChild(raid and "bossLobbies" or "games")
     if not games then return nil end
-    local list = raid and games or games:FindFirstChild("inLobby")
-    if not list then return nil end
-    for _, lobby in ipairs(list:GetChildren()) do
+    local lists = {}
+    if raid then
+        table.insert(lists, games)
+    else
+        local inLobby = games:FindFirstChild("inLobby")
+        if inLobby then table.insert(lists, inLobby) end
+        -- Some queue revisions parent the host lobby directly under games.
+        table.insert(lists, games)
+    end
+    for _, list in ipairs(lists) do
+      for _, lobby in ipairs(list:GetChildren()) do
         local members = raid and lobby:FindFirstChild("players") or lobby
         if lobby.Name == player.Name or (members and members:FindFirstChild(player.Name)) then return lobby end
+      end
     end
     return nil
+end
+
+local function ownerMatches(value)
+    if typeof(value) == "Instance" then
+        return value == player or value:IsA("Player") and value.Name == player.Name
+    end
+    local text = tostring(value or "")
+    return text == player.Name or text == tostring(player.UserId)
+end
+
+function Adapter.isLobbyHost(lobby)
+    if not lobby then return false end
+    if lobby.Name == player.Name then return true end
+    for _, name in ipairs({ "owner", "Owner", "host", "Host", "creator", "Creator", "ownerName", "OwnerName", "hostName", "HostName" }) do
+        local child = lobby:FindFirstChild(name)
+        if child then
+            local value = child:IsA("ObjectValue") and child.Value or child:IsA("ValueBase") and child.Value or child.Name
+            if ownerMatches(value) then return true end
+        end
+        local attribute = lobby:GetAttribute(name)
+        if attribute ~= nil and ownerMatches(attribute) then return true end
+    end
+    return false
 end
 
 function Adapter.createLobby(config)

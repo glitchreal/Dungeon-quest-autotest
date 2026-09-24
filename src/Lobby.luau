@@ -30,8 +30,10 @@ local function queueAction(config, now, arrivedAt)
     local existing = Adapter.findLobby(false)
     if existing then
         if config.AutoStart and now - arrivedAt >= config.StartDelay then
-            Adapter.call("startDungeon")
-            return "Starting dungeon"
+            if not Adapter.isLobbyHost(existing) then return "Lobby ready (waiting for host)" end
+            local ok, err = pcall(Adapter.call, "startDungeon")
+            if ok then return "Starting dungeon" end
+            return "Start failed: " .. tostring(err):sub(1, 80)
         end
         return "Lobby ready"
     end
